@@ -116,6 +116,16 @@ struct TranslateRequest {
     std::uint64_t virtual_address{};
 };
 
+struct DiscoveryRequest {
+    RecordHeader header{};
+    std::uint32_t pid{};
+};
+
+struct ModuleListRequest {
+    RecordHeader header{};
+    std::uint32_t pid{};
+};
+
 struct SessionState {
     Nonce nonce{};
     Capability capabilities{Capability::None};
@@ -129,6 +139,7 @@ static_assert(std::is_standard_layout_v<RecordHeader> && sizeof(RecordHeader) ==
 static_assert(std::is_standard_layout_v<ResultHeader> && sizeof(ResultHeader) == 36);
 static_assert(std::is_standard_layout_v<ScatterDescriptor> && sizeof(ScatterDescriptor) == 16);
 static_assert(sizeof(ScatterReadRequest) == 44 && sizeof(TranslateRequest) == 44);
+static_assert(sizeof(DiscoveryRequest) == 32 && sizeof(ModuleListRequest) == 32);
 
 struct ScatterValidation {
     Error error{Error::Ok};

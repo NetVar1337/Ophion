@@ -96,6 +96,51 @@ void test_nonce_handshake() {
     status.nonce = session.nonce;
     assert(transport.status(status).error == Error::Ok);
 }
+void test_discovery_and_module_transport() {
+    MockMemoryReader memory;
+    PageTableWalker walker(memory, {4, {}});
+    MockTransport transport(walker);
+    const SessionState session = transport.attach(8, Capability::Discovery | Capability::Modules);
+    transport.set_process_catalog({{7, 0x1000, 0x2000, 3, "mock.exe", false}});
+    transport.set_module_catalog(7, {{0x100000, 0x3000, 42, "mock.dll", {}}});
+
+    DiscoveryRequest discovery{};
+    discovery.header = {kProtocolMagic, kProtocolVersion, Command::DiscoverProcess, sizeof(discovery), session.nonce, 0};
+    discovery.pid = 7;
+    ProcessIdentity process{};
+    assert(transport.discover(discovery, process).error == Error::Ok && process.generation == 3);
+    ModuleListRequest list{};
+    list.header = {kProtocolMagic, kProtocolVersion, Command::ListModules, sizeof(list), session.nonce, 0};
+    list.pid = 7;
+    std::vector<ModuleIdentity> modules;
+    assert(transport.list_modules(list, modules).value == 1 && modules.front().name == "mock.dll");
+}
+
+void test_transport_scatter_read() {
+    MockMemoryReader memory;
+    constexpr std::uint64_t va = 0x12345000ULL;
+    memory.map(0x1000, page({{0, 0x2001}}));
+    memory.map(0x2000, page({{0, 0x3001}}));
+    memory.map(0x3000, page({{(va >> 21) & 0x1ff, 0x40000000ULL | 0x81}}));
+    std::vector<std::byte> backing(0x200000);
+    const std::array<std::byte, 8> expected{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4},
+                                            std::byte{5}, std::byte{6}, std::byte{7}, std::byte{8}};
+    std::memcpy(backing.data() + (va & 0x1fffffULL), expected.data(), expected.size());
+    memory.map(0x40000000ULL, backing);
+    PageTableWalker walker(memory, {4, {{0x1000, 0x3000}, {0x40000000ULL, 0x200000}}});
+    MockTransport transport(walker);
+    const SessionState session = transport.attach(9, Capability::Read);
+    ScatterReadRequest request{};
+    request.header = {kProtocolMagic, kProtocolVersion, Command::ScatterRead,
+                      static_cast<std::uint32_t>(sizeof(request) + 2 * sizeof(ScatterDescriptor)), session.nonce, 0};
+    request.directory_table_base = 0x1000;
+    request.range_count = 2;
+    request.total_bytes = 8;
+    const std::array<ScatterDescriptor, 2> descriptors{{{va, 4, 0}, {va + 4, 4, 4}}};
+    std::array<std::byte, 8> output{};
+    const TransportResult result = transport.scatter(request, descriptors, output);
+    assert(result.error == Error::Ok && result.completed_bytes == output.size() && output == expected);
+}
 
 class StubProjector final : public WorldProjector {
 public:
@@ -118,6 +163,50 @@ void test_overlay_model_and_image_rejection() {
     const std::array<std::byte, 64> invalid{};
     assert(PeImagePlanner::build(invalid, plan) == Error::MalformedRecord);
 }
+
+template <typename T>
+void put(std::vector<std::byte>& bytes, std::size_t offset, const T& value) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+void test_guest_reader_and_unreal_adapter() {
+    MockMemoryReader memory;
+    memory.map(0x1000, page({{0, 0x2001}}));
+    memory.map(0x2000, page({{0, 0x3001}}));
+    memory.map(0x3000, page({{2, 0x4001}}));
+    memory.map(0x4000, page({{0, 0x5001}}));
+    std::vector<std::byte> data(0x1000);
+    const std::uint64_t actor_array = 0x400200;
+    const std::uint32_t actor_count = 1;
+    const std::uint64_t actor = 0x400300;
+    const std::uint64_t root = 0x400400;
+    const Vec3 translation{1.0F, 2.0F, 3.0F};
+    const Quat rotation{0.0F, 0.0F, 0.0F, 1.0F};
+    const Vec3 scale{1.0F, 1.0F, 1.0F};
+    put(data, 0x000, actor_array);
+    put(data, 0x008, actor_count);
+    put(data, 0x200, actor);
+    put(data, 0x310, root);
+    put(data, 0x420, translation);
+    put(data, 0x430, rotation);
+    put(data, 0x440, scale);
+    memory.map(0x5000, data);
+
+    PageTableWalker walker(memory, {4, {{0x1000, 0x5000}}});
+    GuestMemoryReader guest(walker, 0x1000);
+    ImageFingerprint fingerprint{};
+    fingerprint.time_date_stamp = 7;
+    OffsetProfile profile(fingerprint, {{"actor_array_rva", 0}, {"actor_count_rva", 8},
+                                              {"actor_root_offset", 0x10}, {"root_translation_offset", 0x20},
+                                              {"root_rotation_offset", 0x30}, {"root_scale_offset", 0x40}});
+    const auto validated = profile.validate(fingerprint);
+    assert(validated.has_value());
+    UnrealAdapter adapter(guest, 0x400000, *validated);
+    GameSnapshot snapshot{};
+    assert(adapter.snapshot(snapshot) == Error::Ok);
+    assert(snapshot.epoch == 1 && snapshot.entities.size() == 1);
+    assert(snapshot.entities.front().identity == actor && snapshot.entities.front().transform.translation.y == 2.0F);
+}
 } // namespace
 
 int main() {
@@ -128,5 +217,8 @@ int main() {
     test_process_lifecycle();
     test_fingerprint_gate();
     test_nonce_handshake();
+    test_discovery_and_module_transport();
+    test_transport_scatter_read();
     test_overlay_model_and_image_rejection();
+    test_guest_reader_and_unreal_adapter();
 }

@@ -66,28 +66,34 @@ public:
 
 class UnrealAdapter final : public GameAdapter {
 public:
-    UnrealAdapter(const MemoryReader& reader, ValidatedOffsetProfile profile) : reader_(reader), profile_(std::move(profile)) {}
+    UnrealAdapter(const GuestMemoryReader& reader, std::uint64_t module_base, ValidatedOffsetProfile profile)
+        : reader_(reader), module_base_(module_base), profile_(std::move(profile)) {}
     [[nodiscard]] Error snapshot(GameSnapshot& output) const override;
 private:
-    const MemoryReader& reader_;
+    const GuestMemoryReader& reader_;
+    std::uint64_t module_base_{};
     ValidatedOffsetProfile profile_;
 };
 
 class UnityIl2CppAdapter final : public GameAdapter {
 public:
-    UnityIl2CppAdapter(const MemoryReader& reader, ValidatedOffsetProfile profile) : reader_(reader), profile_(std::move(profile)) {}
+    UnityIl2CppAdapter(const GuestMemoryReader& reader, std::uint64_t module_base, ValidatedOffsetProfile profile)
+        : reader_(reader), module_base_(module_base), profile_(std::move(profile)) {}
     [[nodiscard]] Error snapshot(GameSnapshot& output) const override;
 private:
-    const MemoryReader& reader_;
+    const GuestMemoryReader& reader_;
+    std::uint64_t module_base_{};
     ValidatedOffsetProfile profile_;
 };
 
 class Source2Adapter final : public GameAdapter {
 public:
-    Source2Adapter(const MemoryReader& reader, ValidatedOffsetProfile profile) : reader_(reader), profile_(std::move(profile)) {}
+    Source2Adapter(const GuestMemoryReader& reader, std::uint64_t module_base, ValidatedOffsetProfile profile)
+        : reader_(reader), module_base_(module_base), profile_(std::move(profile)) {}
     [[nodiscard]] Error snapshot(GameSnapshot& output) const override;
 private:
-    const MemoryReader& reader_;
+    const GuestMemoryReader& reader_;
+    std::uint64_t module_base_{};
     ValidatedOffsetProfile profile_;
 };
 

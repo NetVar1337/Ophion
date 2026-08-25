@@ -63,6 +63,23 @@ private:
     PageWalkOptions options_;
 };
 
+class GuestMemoryReader {
+public:
+    GuestMemoryReader(const PageTableWalker& walker, std::uint64_t directory_table_base) noexcept
+        : walker_(walker), directory_table_base_(directory_table_base) {}
+
+    [[nodiscard]] ReadResult read(std::uint64_t virtual_address, std::span<std::byte> destination) const;
+
+    template <typename T>
+    [[nodiscard]] ReadResult read_object(std::uint64_t virtual_address, T& output) const {
+        return read(virtual_address, std::as_writable_bytes(std::span<T>(&output, 1)));
+    }
+
+private:
+    const PageTableWalker& walker_;
+    std::uint64_t directory_table_base_{};
+};
+
 struct ScatterPlanEntry {
     std::uint64_t virtual_address{};
     std::uint32_t byte_count{};

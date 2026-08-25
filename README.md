@@ -172,13 +172,22 @@ overlay emits draw commands through a caller-owned projector; the PE planner
 only validates image layout into an immutable plan and never maps or executes
 an image.
 
+`GuestMemoryReader` consumes only the bounded page-table walker and caller
+supplied CR3. The in-process transport now covers discovery, module catalog,
+translation, scatter reads, status, and snapshot epochs, each with capability
+and session-nonce validation. Adapter profiles must match a module fingerprint
+and provide engine-specific array/count/root/transform offsets; malformed,
+stale, or oversized snapshots fail closed.
+
+The root `CMakePresets.json` generates one Visual Studio solution for the
+platform library, deterministic tests, and mock client. Open the repository
+folder in Visual Studio's CMake view, or run:
+
 ```powershell
-cmake -S .\platform -B .\build\platform -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
-cmake --build .\build\platform --config Release
-ctest --test-dir .\build\platform -C Release --output-on-failure
-cmake -S .\client -B .\build\client -G "Visual Studio 17 2022" -A x64
-cmake --build .\build\client --config Release
-.\build\client\Release\ophion_mock_client.exe
+cmake --preset vs2022-x64
+cmake --build --preset vs2022-x64-release
+ctest --preset vs2022-x64-release
+.\build\cmake\vs2022-x64\client\Release\ophion_mock_client.exe
 ```
 
 The current bridge is deliberately mock-only. Production Ophion creates no
@@ -268,7 +277,7 @@ Evidence status as of **2026-08-25**:
 | Portable unsigned driver build | Yes | No | Release and Debug x64 built with WDK 10.0.26100.0 and `/WX`; Native x64 PE headers verified by `build.ps1`. |
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
 | Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 146 assertions. |
-| Platform data plane and mock client | Yes | Mock only | C++20 platform library, deterministic tests, and mock client built; `ctest` passed 1/1. No production VMM bridge exists yet. |
+| Platform data plane and mock client | Yes | Mock only | Unified VS2022 CMake preset builds the C++20 library, adapter/guest-reader/command-path tests, and client; `ctest` passed 1/1. No production VMM bridge exists yet. |
 | EAC/EOS fixture harness | Yes | Mock only | Python stdlib harness passed 10/10 recorded-fixture tests; local baseline capture is read-only and no anti-cheat binary was executed. |
 | Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
 | `OphionBoot.efi` boot-time DXE driver | Yes | OVMF shell only | EDK2/VS2022 `RELEASE` build passed; SHA-256 `e051c6aafe092b6c348c0d276d8fcfa0bee14fb1778df29b4839c568d98ec823`. Embedded OVMF reached the UEFI Shell under TCG; TCG has no VMX, so VMLAUNCH is still pending nested-VMX hardware validation. |

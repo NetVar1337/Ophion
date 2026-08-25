@@ -1,11 +1,13 @@
 #pragma once
 
-#include "ophion/platform/memory.hpp"
+#include "ophion/platform/discovery.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
+#include <vector>
 
 namespace ophion::platform {
 
@@ -23,6 +25,10 @@ public:
     [[nodiscard]] SessionState attach(Nonce client_nonce, Capability requested) noexcept;
     void close() noexcept;
     [[nodiscard]] TransportResult status(const RecordHeader& header) noexcept;
+    void set_process_catalog(std::vector<ProcessIdentity> processes);
+    void set_module_catalog(std::uint32_t pid, std::vector<ModuleIdentity> modules);
+    [[nodiscard]] TransportResult discover(const DiscoveryRequest& request, ProcessIdentity& output) noexcept;
+    [[nodiscard]] TransportResult list_modules(const ModuleListRequest& request, std::vector<ModuleIdentity>& output) noexcept;
     [[nodiscard]] TransportResult translate(const TranslateRequest& request) noexcept;
     [[nodiscard]] TransportResult scatter(const ScatterReadRequest& request, std::span<const ScatterDescriptor> descriptors,
                                           std::span<std::byte> output) noexcept;
@@ -38,6 +44,8 @@ private:
     std::array<Command, 64> commands_{};
     std::size_t head_{};
     std::size_t count_{};
+    std::vector<ProcessIdentity> processes_;
+    std::unordered_map<std::uint32_t, std::vector<ModuleIdentity>> modules_;
 };
 
 using MockTransport = InProcessRingTransport;

@@ -1,5 +1,7 @@
 #include "ophion/platform/transport.hpp"
 
+#include <algorithm>
+#include <utility>
 #include <vector>
 
 namespace ophion::platform {
@@ -18,6 +20,42 @@ SessionState InProcessRingTransport::attach(Nonce client_nonce, Capability reque
 }
 
 void InProcessRingTransport::close() noexcept { session_ = {}; }
+
+void InProcessRingTransport::set_process_catalog(std::vector<ProcessIdentity> processes) {
+    processes_ = std::move(processes);
+}
+
+void InProcessRingTransport::set_module_catalog(std::uint32_t pid, std::vector<ModuleIdentity> modules) {
+    modules_[pid] = std::move(modules);
+}
+
+TransportResult InProcessRingTransport::discover(const DiscoveryRequest& request, ProcessIdentity& output) noexcept {
+    output = {};
+    if (request.header.record_bytes != sizeof(request)) return {Error::MalformedRecord, session_.epoch, 0, 0};
+    const Error error = accept(request.header, Command::DiscoverProcess);
+    if (error != Error::Ok) return {error, session_.epoch, 0, 0};
+    const auto process = std::find_if(processes_.begin(), processes_.end(),
+                                      [&request](const ProcessIdentity& candidate) { return candidate.pid == request.pid; });
+    if (process == processes_.end()) return {Error::ProcessNotFound, session_.epoch, 0, 0};
+    if (process->exited) return {Error::ProcessExited, session_.epoch, 0, 0};
+    output = *process;
+    return {Error::Ok, session_.epoch, output.generation, 0};
+}
+
+TransportResult InProcessRingTransport::list_modules(const ModuleListRequest& request,
+                                                     std::vector<ModuleIdentity>& output) noexcept {
+    output.clear();
+    if (request.header.record_bytes != sizeof(request)) return {Error::MalformedRecord, session_.epoch, 0, 0};
+    const Error error = accept(request.header, Command::ListModules);
+    if (error != Error::Ok) return {error, session_.epoch, 0, 0};
+    const auto process = std::find_if(processes_.begin(), processes_.end(),
+                                      [&request](const ProcessIdentity& candidate) { return candidate.pid == request.pid; });
+    if (process == processes_.end()) return {Error::ProcessNotFound, session_.epoch, 0, 0};
+    if (process->exited) return {Error::ProcessExited, session_.epoch, 0, 0};
+    const auto modules = modules_.find(request.pid);
+    if (modules != modules_.end()) output = modules->second;
+    return {Error::Ok, session_.epoch, static_cast<std::uint64_t>(output.size()), 0};
+}
 
 Error InProcessRingTransport::accept(const RecordHeader& header, Command expected) noexcept {
     if (header.command != expected) return Error::BadCommand;

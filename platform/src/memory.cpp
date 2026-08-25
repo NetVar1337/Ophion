@@ -102,6 +102,26 @@ ReadResult PageTableWalker::read_physical(std::uint64_t address, std::span<std::
     return memory_.read_physical(address, destination);
 }
 
+ReadResult GuestMemoryReader::read(std::uint64_t virtual_address, std::span<std::byte> destination) const {
+    std::size_t completed = 0;
+    while (completed < destination.size()) {
+        if (virtual_address > std::numeric_limits<std::uint64_t>::max() - completed) {
+            return {Error::InvalidAddress, completed};
+        }
+        const Translation translated = walker_.translate(directory_table_base_, virtual_address + completed);
+        if (translated.error != Error::Ok) return {translated.error, completed};
+        const std::uint64_t page_offset = (virtual_address + completed) & (translated.page_bytes - 1);
+        const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
+            destination.size() - completed, translated.page_bytes - page_offset));
+        const ReadResult physical = walker_.read_physical(translated.physical_address, destination.subspan(completed, chunk));
+        completed += physical.bytes_read;
+        if (physical.bytes_read != chunk) {
+            return {physical.error == Error::Ok ? Error::PartialRead : physical.error, completed};
+        }
+    }
+    return {Error::Ok, completed};
+}
+
 ScatterPlan validate_and_coalesce(std::span<const ScatterPlanEntry> entries) noexcept {
     std::vector<ScatterDescriptor> descriptors;
     descriptors.reserve(entries.size());
