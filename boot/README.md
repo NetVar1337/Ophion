@@ -6,7 +6,7 @@ This changes the detection model: Windows caches a coherent `Microsoft Hv` platf
 
 ## Build
 
-Prerequisites: an EDK2 checkout with Windows BaseTools, NASM, iasl, and Visual Studio C++ x64 tools. The package was compiled with EDK2/VS2022 as both `NOOPT` and `RELEASE` during this work.
+Prerequisites: an EDK2 checkout with Windows BaseTools, NASM, iasl, and Visual Studio C++ x64 tools.
 
 ```powershell
 pwsh -NoProfile -File .\boot\build.ps1 `
@@ -22,10 +22,10 @@ Expected output:
 <Edk2Root>\Build\OphionBoot\RELEASE_VS2022\X64\OphionBoot.efi
 ```
 
-The validated Release artifact built on this workstation hashed to:
+Latest fully compiled DXE artifact (after full event/NMI/CR/DR handling) SHA-256:
 
 ```text
-79b9d6fc8a9370a79153d3cc1a4a4b305c970f02bf19c038b387a14226f5d3ed
+e051c6aafe092b6c348c0d276d8fcfa0bee14fb1778df29b4839c568d98ec823
 ```
 
 ## Hyper-V attachment preflight
@@ -43,15 +43,56 @@ pwsh -NoProfile -File .\tools\hyperv-attachment-preflight.ps1
 real `Microsoft Hv` stratum. The attachment design and license boundary are
 in [`HyperVAttachment.md`](HyperVAttachment.md).
 
-## Lab boot path
+## OVMF lab path
 
-1. Use a disposable OVMF VM first. Add `OphionBootPkg/Application/OphionBoot.inf` to the OVMF platform DSC `[Components]` and rebuild OVMF so this **DXE driver** remains resident through `ExitBootServices`; do not launch the EFI file as a transient `StartImage` application.
-2. Keep Secure Boot off for the unsigned lab image, or enroll a test key and sign the OVMF/DXE image.
-3. Capture serial/debug output, then confirm Windows reaches the loader with CPUID.1.ECX[31] set and `CPUID(0x40000000)` equal to `Microsoft Hv`.
-4. Run the repository's `OphionProbe`, VMAware, hvdetecc, and the Hyper-V stratum of the detector matrix from a disposable account/VM only.
+The lab runner is intentionally manual; it is never called by a build or test:
 
+```powershell
+pwsh -NoProfile -File .\boot\run-ovmf-lab.ps1 `
+  -Edk2Root $env:OPHION_EDK2 `
+  -NasmPrefix $env:NASM_PREFIX `
+  -IaslPrefix $env:IASL_PREFIX `
+  -QemuPath C:\path\to\qemu-system-x86_64.exe `
+  -DriveImage C:\lab\disposable.img
+```
+
+It creates a temporary OVMF DSC with the resident DXE component, builds that
+OVMF image, and writes `boot\ovmf-serial.log`. It uses TCG plus `max,+vmx`
+only as a controlled smoke path; a host must expose working nested VMX for
+`VMLAUNCH` to succeed.
+
+Expected observations, in order:
+
+1. The OVMF serial log reaches the DXE/ReadyToBoot phase without a VMX entry
+   failure; `OphionBoot: <n> cores virtualized, 0 failed` is the required
+   driver diagnostic when OVMF debug is routed to serial.
+2. The runtime telemetry page has magic `OPBT`, capacity 128, and records the
+   first exit followed by CPUID and Hyper-V MSR persona records. It is runtime
+   allocated, so it remains readable from the host mapping after
+   `ExitBootServices`.
+3. The guest exposes CPUID.1.ECX[31] and `CPUID(0x40000000) = Microsoft Hv`;
+   the synthetic MSRs 0x40000000–0x40000002 complete without a VMX-root
+   exception.
+4. With the compile-time concealment lab switch enabled, telemetry shows one
+   publish record, one prepare-INVEPT acknowledgement per launched VCPU, then
+   one post-change INVEPT acknowledgement per launched VCPU before release.
+   The EPT redirect is not changed before the first barrier and no VCPU is
+   resumed before the second barrier.
+
+Failure signatures:
+
+| Signature | Meaning |
+| --- | --- |
+| `OpbTelemetryVmEntryFailure` / terminal reason 2 | VM entry or resume failed; inspect the current VMCS instruction error and nested-VMX exposure. |
+| terminal reason 1 | VMREAD/VMWRITE failed; the VMCS was not current or control state was invalid. |
+| terminal reason 3 | EPT violation/misconfiguration was not an allowed lab mapping transition. |
+| terminal reason 4 or `OpbConcealAbort` | A local INVEPT or concealment rendezvous failed; do not continue the guest. |
+| OVMF resets or no serial progression after ReadyToBoot | Nested VMX is unavailable or the OVMF/QEMU CPU configuration cannot execute VMX. |
+
+`OphionBootConcealRuntime` and `OPB_ENABLE_RUNTIME_CONCEALMENT` remain
+disabled by default. Concealment contains no EPT code hook.
 ## Current boundary
 
-This is a compiled boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It intentionally provides only the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for flush/post-message style hypercalls. The allocation registry and dummy-page redirector are compile-present but disabled; the redirector is intentionally single-core until the attachment mode provides all-vCPU stop/ack and INVEPT synchronization. Expand it only from trace evidence captured during the OVMF boot path.
+This is a boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It provides only the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for selected flush/post-message calls. The allocation registry and dummy-page redirector are compile-present but disabled. When explicitly enabled for OVMF, concealment uses a two-barrier, all-launched-VCPU INVEPT epoch; it never uses EPT code hooks and terminalizes rather than allowing a failed barrier to resume a guest.
 
 Do not modify `bootmgfw.efi`, SPI flash, measured-boot state, TPM state, or a production ESP until the OVMF boot matrix is green.

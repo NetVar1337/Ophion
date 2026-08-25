@@ -10,6 +10,7 @@
 
 extern ASM_PFX(OpbVmExitHandler)
 extern ASM_PFX(OpbSetupCurrentCore)
+extern ASM_PFX(OpbVmxEntryFailure)
 DEFAULT REL
 SECTION .text
 
@@ -18,6 +19,8 @@ global ASM_PFX(AsmVmExitStub)
 global ASM_PFX(AsmInveptSingleContext)
 global ASM_PFX(OpbAsmSaveAndVirtualize)
 global ASM_PFX(OpbAsmLaunchResume)
+global ASM_PFX(OpbVmread)
+global ASM_PFX(OpbVmwrite)
 
 
 ;------------------------------------------------------------------------------
@@ -56,7 +59,7 @@ ASM_PFX(AsmInveptSingleContext):
     push    rbx
     sub     rsp, 16
     mov     [rsp], rcx               ; INVEPT descriptor: EPTP
-    mov     dword [rsp+8], 0
+    mov     qword [rsp+8], 0
     xor     rcx, rcx
     inc     rcx                      ; type 1 = single-context
     lea     rdx, [rsp]
@@ -107,7 +110,12 @@ ASM_PFX(OpbAsmSaveAndVirtualize):
     jnz     .launch_fail
 
     vmlaunch
-    mov     rax, 0x800000000000000E
+    mov     ecx, [rsp + 0x28]
+    mov     edx, 2                  ; terminal VM-entry failure
+    sub     rsp, 0x28
+    call    ASM_PFX(OpbVmxEntryFailure)
+    cli
+    jmp     $
 
 .launch_fail:
     add     rsp, 0x20
@@ -183,6 +191,9 @@ ASM_PFX(AsmVmExitStub):
     push    rdx
     push    rcx
     push    rax
+    mov     ecx, 0x681c             ; VMCS_GUEST_RSP
+    vmread  rax, rcx
+    mov     [rsp+0x20], rax         ; OPB_GUEST_REGS.rsp
 
     mov     rcx, rsp                 ; OPB_GUEST_REGS*
     mov     rdx, [rsp + 0x1A8]       ; OPB_VCPU* at HOST_RSP+8
@@ -190,9 +201,17 @@ ASM_PFX(AsmVmExitStub):
     sub     rsp, 0x20                ; shadow space
     call    ASM_PFX(OpbVmExitHandler)
     add     rsp, 0x20
-
-    cmp     al, 1
-    je      .vmxoff_path
+    mov     r11b, al
+    mov     rax, [rsp+0x20]          ; OPB_GUEST_REGS.rsp
+    mov     ecx, 0x681c
+    vmwrite rax, rcx
+    jnc     .resume_prepare
+    mov     rcx, [rsp + 0x1A8]
+    mov     edx, 1
+    sub     rsp, 0x28
+    call    ASM_PFX(OpbVmxEntryFailure)
+.resume_prepare:
+    cmp     r11b, 1
 
     pop     rax
     pop     rcx
@@ -224,8 +243,11 @@ ASM_PFX(AsmVmExitStub):
     add     rsp, 8                   ; skip alignment padding
 
     vmresume
-    ; VMRESUME failure falls through to halt - a boot hypervisor must never
-    ; return into firmware state with VMX half-configured.
+    ; VMRESUME failure is terminal; HOST_RSP has been restored to stack top.
+    mov     rcx, [rsp-8]
+    mov     edx, 2
+    sub     rsp, 0x28
+    call    ASM_PFX(OpbVmxEntryFailure)
     cli
 .halt:
     hlt
@@ -285,7 +307,28 @@ ASM_PFX(AsmVmread64):
 
 global ASM_PFX(AsmVmwrite64)
 ASM_PFX(AsmVmwrite64):
-    vmwrite  rcx, rdx
+    vmwrite  rdx, rcx
+    xor     rax, rax
+    ret
+
+global ASM_PFX(OpbVmread)
+ASM_PFX(OpbVmread):
+    vmread  rax, rcx
+    jc      .vmread_fail
+    mov     [rdx], rax
+    xor     rax, rax
+    ret
+.vmread_fail:
+    mov     rax, 0x800000000000000E
+    ret
+
+global ASM_PFX(OpbVmwrite)
+ASM_PFX(OpbVmwrite):
+    vmwrite rdx, rcx
+    jnc     .vmwrite_ok
+    mov     rax, 0x800000000000000E
+    ret
+.vmwrite_ok:
     xor     rax, rax
     ret
 

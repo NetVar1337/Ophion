@@ -26,6 +26,56 @@
 #endif
 
 #define OPB_MAX_RUNTIME_ALLOCS  256
+#define OPB_TELEMETRY_CAPACITY  128
+#define OPB_PENDING_EXT_INTERRUPTS 16
+
+typedef enum {
+    OpbTelemetryVmEntryFailure = 1,
+    OpbTelemetryFirstExit,
+    OpbTelemetryCpuid,
+    OpbTelemetryMsrRead,
+    OpbTelemetryMsrWrite,
+    OpbTelemetryConcealPublish,
+    OpbTelemetryConcealPrepareAck,
+    OpbTelemetryConcealInvalidateAck,
+    OpbTelemetryTerminal
+} OPB_TELEMETRY_EVENT;
+
+typedef struct {
+    UINT64 Sequence;
+    UINT64 Tsc;
+    UINT32 Event;
+    UINT32 Core;
+    UINT32 Arg0;
+    UINT32 Arg1;
+    UINT64 Value;
+} OPB_TELEMETRY_RECORD;
+
+typedef struct {
+    UINT32 Magic;
+    UINT32 Capacity;
+    volatile UINT32 WriteIndex;
+    volatile UINT32 Sequence;
+    OPB_TELEMETRY_RECORD Records[OPB_TELEMETRY_CAPACITY];
+} OPB_TELEMETRY_RING;
+
+typedef enum {
+    OpbConcealIdle,
+    OpbConcealPublishing,
+    OpbConcealPrepare,
+    OpbConcealInvalidate,
+    OpbConcealRelease,
+    OpbConcealAbort
+} OPB_CONCEAL_STATE;
+
+typedef struct {
+    volatile UINT32 Generation;
+    volatile UINT32 State;
+    volatile UINT32 Participants;
+    volatile UINT32 PrepareAcks;
+    volatile UINT32 InvalidateAcks;
+    UINT32 Leader;
+} OPB_CONCEAL_EPOCH;
 
 typedef enum {
     OpbAllocVmxon,
@@ -34,7 +84,8 @@ typedef enum {
     OpbAllocHostStack,
     OpbAllocEptTable,
     OpbAllocHostCr3,
-    OpbAllocDummyPage
+    OpbAllocDummyPage,
+    OpbAllocTelemetry
 } OPB_ALLOC_KIND;
 
 typedef struct {
@@ -50,8 +101,9 @@ typedef struct {
 } OPB_GUEST_REGS;
 
 typedef struct {
-    /* must stay first: assembly locates it relative to HOST_RSP */
+    /* must stay first: assembly locates the VCPU from HOST_RSP. */
     volatile INT32 nmi_pending;
+    volatile UINT32 active;
 
     UINT64 vmxon_pa;
     UINT64 vmcs_pa;
@@ -62,12 +114,26 @@ typedef struct {
     BOOLEAN launched;
     BOOLEAN terminal;
     UINT32 last_exit_reason;
+    UINT32 terminal_reason;
+    UINT64 terminal_detail;
 
-    /* persona floor state */
-    UINT64 hv_guest_os_id;        /* MSR 0x40000000 shadow */
-    UINT64 hv_hypercall_gpa;      /* GPA written to MSR 0x40000001 */
+    /* Persona and architecturally virtualized state. */
+    UINT64 hv_guest_os_id;
+    UINT64 hv_hypercall_gpa;
     UINT64 exit_count;
-
+    UINT64 xcr0;
+    UINT64 guest_dr0;
+    UINT64 guest_dr1;
+    UINT64 guest_dr2;
+    UINT64 guest_dr3;
+    UINT64 guest_dr6;
+    UINT8 guest_cr8;
+    UINT8 pending_ext_head;
+    UINT8 pending_ext_tail;
+    UINT8 pending_ext_count;
+    UINT8 pending_ext_vectors[OPB_PENDING_EXT_INTERRUPTS];
+    UINT32 conceal_prepare_generation;
+    UINT32 conceal_invalidate_generation;
 
     OPB_GUEST_REGS regs;
 } OPB_VCPU;
@@ -84,6 +150,8 @@ extern OPB_RUNTIME_ALLOCATION g_opb_runtime_allocs[OPB_MAX_RUNTIME_ALLOCS];
 extern UINTN g_opb_runtime_alloc_count;
 extern EFI_PHYSICAL_ADDRESS g_opb_host_cr3;
 extern EFI_PHYSICAL_ADDRESS g_opb_dummy_page;
+extern OPB_TELEMETRY_RING *g_opb_telemetry;
+extern OPB_CONCEAL_EPOCH g_opb_conceal_epoch;
 
 EFI_STATUS
 OpbAllocateRuntimePages (
@@ -98,7 +166,42 @@ EFI_STATUS
 OpbBuildHostIdentityCr3 (VOID);
 
 EFI_STATUS
-OpbConcealRuntimeAllocations (VOID);
+OpbConcealRuntimeAllocations (
+    OPB_VCPU *Leader
+    );
+
+EFI_STATUS
+OpbConcealPoll (
+    OPB_VCPU *Vcpu
+    );
+
+VOID
+OpbTelemetryInitialize (
+    VOID
+    );
+
+VOID
+OpbTelemetryRecord (
+    OPB_TELEMETRY_EVENT Event,
+    OPB_VCPU *Vcpu,
+    UINT32 Arg0,
+    UINT32 Arg1,
+    UINT64 Value
+    );
+
+VOID
+OpbTerminalize (
+    OPB_VCPU *Vcpu,
+    UINT32 Reason,
+    UINT64 Detail
+    );
+
+VOID
+EFIAPI
+OpbVmxEntryFailure (
+    UINT32 CoreIndex,
+    UINT32 Reason
+    );
 
 /* Assembly.nasm */
 extern EFI_STATUS
@@ -128,6 +231,20 @@ extern EFI_STATUS
 EFIAPI
 OpbVmptrld (
     UINT64 *VmcsPhysicalAddress
+    );
+
+extern EFI_STATUS
+EFIAPI
+OpbVmread (
+    UINT64 Field,
+    UINT64 *Value
+    );
+
+extern EFI_STATUS
+EFIAPI
+OpbVmwrite (
+    UINT64 Field,
+    UINT64 Value
     );
 
 extern VOID

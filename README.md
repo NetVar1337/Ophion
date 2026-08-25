@@ -159,6 +159,46 @@ pwsh -NoProfile -File .\boot\build.ps1 `
   -IaslPrefix $env:IASL_PREFIX `
   -Target RELEASE
 ```
+
+## Game data-plane foundation
+
+`platform/` and `client/` provide a dependency-free C++20 foundation for
+read-only externals. The protocol is versioned and bounded; it supports only
+status, discovery, module enumeration, VA translation, coherent snapshots,
+and scatter reads. Its page walker handles 4-/5-level paging and large pages,
+Unreal, Unity IL2CPP, and Source2 adapters refuse to run until a build
+fingerprint validates the supplied offset profile. A renderer-neutral external
+overlay emits draw commands through a caller-owned projector; the PE planner
+only validates image layout into an immutable plan and never maps or executes
+an image.
+
+```powershell
+cmake -S .\platform -B .\build\platform -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=ON
+cmake --build .\build\platform --config Release
+ctest --test-dir .\build\platform -C Release --output-on-failure
+cmake -S .\client -B .\build\client -G "Visual Studio 17 2022" -A x64
+cmake --build .\build\client --config Release
+.\build\client\Release\ophion_mock_client.exe
+```
+
+The current bridge is deliberately mock-only. Production Ophion creates no
+device or IOCTL endpoint; a real VMM command page is an attachment-mode gate,
+not an implicit kernel client.
+
+## EAC and BattlEye lab harness
+
+`lab/eac_harness.py` consumes recorded JSONL fixtures only. It models the
+public EAC/EOS startup observations—SystemHypervisorDetailInformation/CPUID,
+KUSER/QPC, synthetic MSR direction, stack/image/module records, NMI metadata,
+and TPM/measured-boot state—without shipping or attaching to an anti-cheat
+binary. `lab/be_eac_test_matrix.json` records the required bare-metal,
+Hyper-V/VBS, runtime, DXE, and attachment strata.
+
+```powershell
+python .\tests\eac_startup_harness_test.py
+pwsh -NoProfile -File .\lab\capture-local-baseline.ps1 -OutputPath .\build\eac-local-baseline.jsonl
+pwsh -NoProfile -File .\tools\hyperv-attachment-preflight.ps1
+```
 ## Loading
 
 Loading is intentionally not automated. An administrator can register a driver produced or signed for the target machine:
@@ -227,9 +267,11 @@ Evidence status as of **2026-08-25**:
 |---|---:|---:|---|
 | Portable unsigned driver build | Yes | No | Release and Debug x64 built with WDK 10.0.26100.0 and `/WX`; Native x64 PE headers verified by `build.ps1`. |
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
-| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 145 assertions. |
+| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 146 assertions. |
+| Platform data plane and mock client | Yes | Mock only | C++20 platform library, deterministic tests, and mock client built; `ctest` passed 1/1. No production VMM bridge exists yet. |
+| EAC/EOS fixture harness | Yes | Mock only | Python stdlib harness passed 10/10 recorded-fixture tests; local baseline capture is read-only and no anti-cheat binary was executed. |
 | Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
-| `OphionBoot.efi` boot-time DXE driver | Yes | No | EDK2/VS2022 `RELEASE` build passed; SHA-256 `79b9d6fc8a9370a79153d3cc1a4a4b305c970f02bf19c038b387a14226f5d3ed`. OVMF/hardware boot is pending. |
+| `OphionBoot.efi` boot-time DXE driver | Yes | OVMF shell only | EDK2/VS2022 `RELEASE` build passed; SHA-256 `e051c6aafe092b6c348c0d276d8fcfa0bee14fb1778df29b4839c568d98ec823`. Embedded OVMF reached the UEFI Shell under TCG; TCG has no VMX, so VMLAUNCH is still pending nested-VMX hardware validation. |
 | VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
 | Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
 | EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |

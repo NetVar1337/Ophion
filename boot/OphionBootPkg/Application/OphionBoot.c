@@ -107,6 +107,8 @@ OphionBootEntry (
     (VOID)ImageHandle;
     (VOID)SystemTable;
 
+    OpbTelemetryInitialize ();
+
     Status = gBS->LocateProtocol (&gEfiMpServiceProtocolGuid, NULL,
                                   (VOID **)&m_MpServices);
     if (EFI_ERROR (Status)) {

@@ -9,6 +9,7 @@
 
 #include "OphionBoot.h"
 #include <Library/PcdLib.h>
+#include <intrin.h>
 
 /* VMCS field encodings (Intel SDM Appendix B) */
 #define VMCS_VPID                       0x00000000
@@ -105,15 +106,26 @@
 #define VMCS_HOST_RSP                   0x00006C14
 #define VMCS_HOST_RIP                   0x00006C16
 
-/* control bits */
-#define PINCTRL_NMI_EXIT                BIT3
-#define EXECCTRL_CPUID_EXIT             BIT21
-#define EXECCTRL_USE_MSR_BITMAP         BIT28
-#define EXECCTRL_USE_IO_BITMAPS         BIT25
-#define EXECCTRL_ACTIVATE_SECONDARY     BIT31
-#define PROC2_ENABLE_EPT                BIT1
-#define EXITCTRL_HOST_64BIT             BIT9
-#define ENTRYCTRL_LONG_MODE_GUEST       BIT9
+#define PINCTRL_EXTINT_EXIT            BIT0
+#define PINCTRL_NMI_EXIT               BIT3
+#define PINCTRL_VIRTUAL_NMI            BIT5
+#define EXECCTRL_INT_WINDOW_EXIT       BIT2
+#define EXECCTRL_HLT_EXIT              BIT7
+#define EXECCTRL_INVLPG_EXIT           BIT9
+#define EXECCTRL_CR3_LOAD_EXIT         BIT15
+#define EXECCTRL_CR3_STORE_EXIT        BIT16
+#define EXECCTRL_CR8_LOAD_EXIT         BIT19
+#define EXECCTRL_CR8_STORE_EXIT        BIT20
+#define EXECCTRL_NMI_WINDOW_EXIT       BIT22
+#define EXECCTRL_MOV_DR_EXIT           BIT23
+#define EXECCTRL_CPUID_EXIT            BIT21
+#define EXECCTRL_USE_MSR_BITMAP        BIT28
+#define EXECCTRL_USE_IO_BITMAPS        BIT25
+#define EXECCTRL_ACTIVATE_SECONDARY    BIT31
+#define PROC2_ENABLE_EPT               BIT1
+#define EXITCTRL_HOST_64BIT            BIT9
+#define EXITCTRL_ACK_INTERRUPT         BIT15
+#define ENTRYCTRL_LONG_MODE_GUEST      BIT9
 
 /* MSRs */
 #define IA32_VMX_BASIC_MSR              0x480
@@ -164,6 +176,100 @@ OPB_RUNTIME_ALLOCATION g_opb_runtime_allocs[OPB_MAX_RUNTIME_ALLOCS];
 UINTN g_opb_runtime_alloc_count = 0;
 EFI_PHYSICAL_ADDRESS g_opb_host_cr3 = 0;
 EFI_PHYSICAL_ADDRESS g_opb_dummy_page = 0;
+
+OPB_TELEMETRY_RING *g_opb_telemetry = NULL;
+OPB_CONCEAL_EPOCH g_opb_conceal_epoch;
+
+VOID
+OpbTelemetryInitialize (
+    VOID
+    )
+{
+    VOID *Page;
+
+    if (g_opb_telemetry != NULL) {
+        return;
+    }
+    Page = NULL;
+    if (EFI_ERROR (OpbAllocateRuntimePages (
+                       OpbAllocTelemetry,
+                       EFI_SIZE_TO_PAGES (sizeof (OPB_TELEMETRY_RING)),
+                       MAX_PHYS_4GB,
+                       TRUE,
+                       &Page))) {
+        return;
+    }
+    g_opb_telemetry = Page;
+    g_opb_telemetry->Magic = SIGNATURE_32 ('O', 'P', 'B', 'T');
+    g_opb_telemetry->Capacity = OPB_TELEMETRY_CAPACITY;
+}
+
+VOID
+OpbTelemetryRecord (
+    OPB_TELEMETRY_EVENT Event,
+    OPB_VCPU *Vcpu,
+    UINT32 Arg0,
+    UINT32 Arg1,
+    UINT64 Value
+    )
+{
+    UINT32 Sequence;
+    UINT32 Slot;
+    OPB_TELEMETRY_RECORD *Record;
+
+    if (g_opb_telemetry == NULL) {
+        return;
+    }
+    Sequence = (UINT32)_InterlockedIncrement (
+                         (volatile long *)&g_opb_telemetry->Sequence);
+    Slot = (UINT32)_InterlockedIncrement (
+                       (volatile long *)&g_opb_telemetry->WriteIndex) %
+           OPB_TELEMETRY_CAPACITY;
+    Record = &g_opb_telemetry->Records[Slot];
+    Record->Tsc = AsmReadTsc ();
+    Record->Event = Event;
+    Record->Core = Vcpu == NULL ? MAX_UINT32 : Vcpu->core_index;
+    Record->Arg0 = Arg0;
+    Record->Arg1 = Arg1;
+    Record->Value = Value;
+    MemoryFence ();
+    Record->Sequence = Sequence;
+}
+
+VOID
+OpbTerminalize (
+    OPB_VCPU *Vcpu,
+    UINT32 Reason,
+    UINT64 Detail
+    )
+{
+    if (Vcpu != NULL) {
+        Vcpu->terminal = TRUE;
+        Vcpu->terminal_reason = Reason;
+        Vcpu->terminal_detail = Detail;
+    }
+    if (g_opb_conceal_epoch.State != OpbConcealIdle &&
+        g_opb_conceal_epoch.State != OpbConcealRelease) {
+        g_opb_conceal_epoch.State = OpbConcealAbort;
+        MemoryFence ();
+    }
+    OpbTelemetryRecord (OpbTelemetryTerminal, Vcpu, Reason, 0, Detail);
+    CpuDeadLoop ();
+}
+
+VOID
+EFIAPI
+OpbVmxEntryFailure (
+    UINT32 CoreIndex,
+    UINT32 Reason
+    )
+{
+    OPB_VCPU *Vcpu;
+
+    Vcpu = CoreIndex < OPB_MAX_PROCESSORS ? &g_opb_vcpu[CoreIndex] : NULL;
+    OpbTelemetryRecord (OpbTelemetryVmEntryFailure, Vcpu, Reason, 0, 0);
+    OpbTerminalize (Vcpu, Reason, 0);
+}
 
 EFI_STATUS
 OpbAllocateRuntimePages (
@@ -542,44 +648,32 @@ OpbEptSplit2Mb (
     return EFI_SUCCESS;
 }
 
+STATIC
 EFI_STATUS
-OpbConcealRuntimeAllocations (VOID)
+OpbApplyConcealment (
+    VOID
+    )
 {
     EFI_STATUS Status;
-    VOID *Dummy = NULL;
     UINTN AllocationIndex;
 
-    /*
-     * INVEPT is per logical processor. Keep the lab feature single-core
-     * until the attachment path supplies an all-core stop/ack epoch and
-     * invalidates every active EPT context.
-     */
-    if (g_opb_cpu_count != 1) {
-        return EFI_UNSUPPORTED;
+    if (g_opb_dummy_page == 0) {
+        return EFI_NOT_READY;
     }
-    if (m_RuntimeConcealed) {
-        return EFI_SUCCESS;
-    }
-    Status = OpbAllocateRuntimePages (
-                 OpbAllocDummyPage, 1, MAX_PHYS_4GB, FALSE, &Dummy);
-    if (EFI_ERROR (Status)) {
-        return Status;
-    }
-    SetMem (Dummy, 0x1000, 0xFF);
-    g_opb_dummy_page = (EFI_PHYSICAL_ADDRESS)(UINTN)Dummy;
 
     for (AllocationIndex = 0;
          AllocationIndex < g_opb_runtime_alloc_count;
          AllocationIndex++) {
-        OPB_RUNTIME_ALLOCATION *Allocation =
-            &g_opb_runtime_allocs[AllocationIndex];
+        OPB_RUNTIME_ALLOCATION *Allocation;
         UINTN Page;
 
+        Allocation = &g_opb_runtime_allocs[AllocationIndex];
         if (!Allocation->Conceal || Allocation->Kind == OpbAllocDummyPage) {
             continue;
         }
         for (Page = 0; Page < Allocation->Pages; Page++) {
             OPB_EPT_ENTRY *Leaf;
+
             Status = OpbEptSplit2Mb (
                          Allocation->Base + EFI_PAGES_TO_SIZE (Page), &Leaf);
             if (EFI_ERROR (Status)) {
@@ -592,8 +686,166 @@ OpbConcealRuntimeAllocations (VOID)
             Leaf->Type = 6;
         }
     }
+    return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+OpbConcealAcknowledge (
+    OPB_VCPU *Vcpu,
+    BOOLEAN Invalidate
+    )
+{
+    EFI_STATUS Status;
+    UINT32 Generation;
+
+    Generation = g_opb_conceal_epoch.Generation;
+    if (Invalidate) {
+        if (Vcpu->conceal_invalidate_generation == Generation) {
+            return EFI_SUCCESS;
+        }
+    } else if (Vcpu->conceal_prepare_generation == Generation) {
+        return EFI_SUCCESS;
+    }
+
+    Status = AsmInveptSingleContext (m_EptPointer);
+    if (EFI_ERROR (Status)) {
+        g_opb_conceal_epoch.State = OpbConcealAbort;
+        MemoryFence ();
+        return Status;
+    }
+
+    if (Invalidate) {
+        Vcpu->conceal_invalidate_generation = Generation;
+        (VOID)_InterlockedIncrement (
+            (volatile long *)&g_opb_conceal_epoch.InvalidateAcks);
+        OpbTelemetryRecord (
+            OpbTelemetryConcealInvalidateAck, Vcpu, Generation,
+            g_opb_conceal_epoch.InvalidateAcks, m_EptPointer);
+    } else {
+        Vcpu->conceal_prepare_generation = Generation;
+        (VOID)_InterlockedIncrement (
+            (volatile long *)&g_opb_conceal_epoch.PrepareAcks);
+        OpbTelemetryRecord (
+            OpbTelemetryConcealPrepareAck, Vcpu, Generation,
+            g_opb_conceal_epoch.PrepareAcks, m_EptPointer);
+    }
+    MemoryFence ();
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+OpbConcealPoll (
+    OPB_VCPU *Vcpu
+    )
+{
+    EFI_STATUS Status;
+    UINT32 State;
+
+    if (Vcpu == NULL || !Vcpu->launched) {
+        return EFI_SUCCESS;
+    }
+    for (;;) {
+        State = g_opb_conceal_epoch.State;
+        if (State == OpbConcealIdle || State == OpbConcealRelease) {
+            return EFI_SUCCESS;
+        }
+        if (State == OpbConcealAbort) {
+            return EFI_DEVICE_ERROR;
+        }
+        if (State == OpbConcealPublishing) {
+            CpuPause ();
+            continue;
+        }
+        if (State == OpbConcealPrepare) {
+            Status = OpbConcealAcknowledge (Vcpu, FALSE);
+        } else {
+            Status = OpbConcealAcknowledge (Vcpu, TRUE);
+        }
+        if (EFI_ERROR (Status)) {
+            return Status;
+        }
+        CpuPause ();
+    }
+}
+
+EFI_STATUS
+OpbConcealRuntimeAllocations (
+    OPB_VCPU *Leader
+    )
+{
+    EFI_STATUS Status;
+    UINT32 Participants;
+    UINTN Index;
+
+    if (Leader == NULL || m_RuntimeConcealed) {
+        return Leader == NULL ? EFI_INVALID_PARAMETER : EFI_SUCCESS;
+    }
+    if ((UINT32)_InterlockedCompareExchange (
+            (volatile long *)&g_opb_conceal_epoch.State,
+            (long)OpbConcealPublishing,
+            (long)OpbConcealIdle) != OpbConcealIdle) {
+        return OpbConcealPoll (Leader);
+    }
+
+    Participants = 0;
+    for (Index = 0; Index < g_opb_cpu_count; Index++) {
+        if (g_opb_vcpu[Index].launched && !g_opb_vcpu[Index].terminal) {
+            Participants++;
+        }
+    }
+    if (Participants == 0) {
+        g_opb_conceal_epoch.State = OpbConcealAbort;
+        return EFI_NOT_READY;
+    }
+    g_opb_conceal_epoch.Leader = Leader->core_index;
+    g_opb_conceal_epoch.Participants = Participants;
+    g_opb_conceal_epoch.PrepareAcks = 0;
+    g_opb_conceal_epoch.InvalidateAcks = 0;
+    g_opb_conceal_epoch.Generation++;
+    MemoryFence ();
+    g_opb_conceal_epoch.State = OpbConcealPrepare;
+    OpbTelemetryRecord (
+        OpbTelemetryConcealPublish, Leader, g_opb_conceal_epoch.Generation,
+        Participants, m_EptPointer);
+
+    Status = OpbConcealAcknowledge (Leader, FALSE);
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+    while (g_opb_conceal_epoch.PrepareAcks != Participants) {
+        if (g_opb_conceal_epoch.State == OpbConcealAbort) {
+            return EFI_DEVICE_ERROR;
+        }
+        CpuPause ();
+    }
+
+    /*
+     * Every launched VCPU is now held in VMX root. No mapping changes before
+     * this barrier, and no guest resumes until the post-change INVEPT barrier.
+     */
+    Status = OpbApplyConcealment ();
+    if (EFI_ERROR (Status)) {
+        g_opb_conceal_epoch.State = OpbConcealAbort;
+        MemoryFence ();
+        return Status;
+    }
     m_RuntimeConcealed = TRUE;
-    return AsmInveptSingleContext (m_EptPointer);
+    MemoryFence ();
+    g_opb_conceal_epoch.State = OpbConcealInvalidate;
+    Status = OpbConcealAcknowledge (Leader, TRUE);
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+    while (g_opb_conceal_epoch.InvalidateAcks != Participants) {
+        if (g_opb_conceal_epoch.State == OpbConcealAbort) {
+            return EFI_DEVICE_ERROR;
+        }
+        CpuPause ();
+    }
+    MemoryFence ();
+    g_opb_conceal_epoch.State = OpbConcealRelease;
+    return EFI_SUCCESS;
 }
 
 /* update CR0/CR4 to satisfy VMX fixed bits and enable VMXE */
@@ -700,6 +952,25 @@ OpbSetupCurrentCore (
     SetMem (VmcsRegion, 0x1000, 0);
     SetMem (MsrBitmap, 0x1000, 0);
     SetMem (HostStack, OPB_VMM_STACK_SIZE, 0);
+
+#if OPB_ENABLE_RUNTIME_CONCEALMENT
+    /*
+     * Concealment cannot allocate after ExitBootServices. Allocate its dummy
+     * page before the shared EPT snapshot so it is a valid, non-concealed GPA.
+     */
+    if (g_opb_dummy_page == 0) {
+        VOID *Dummy;
+
+        Dummy = NULL;
+        Status = OpbAllocateRuntimePages (
+                     OpbAllocDummyPage, 1, MAX_PHYS_4GB, FALSE, &Dummy);
+        if (EFI_ERROR (Status)) {
+            return Status;
+        }
+        SetMem (Dummy, 0x1000, 0xFF);
+        g_opb_dummy_page = (EFI_PHYSICAL_ADDRESS)(UINTN)Dummy;
+    }
+#endif
 
     /*
      * The Intel MSR bitmap explicitly covers only low (0x0000-0x1FFF)
@@ -816,9 +1087,13 @@ OpbSetupCurrentCore (
     VmWrite64 (VMCS_GUEST_CR4, AsmReadCr4 () | 0x2000);
     VmWrite64 (VMCS_GUEST_DR7, 0x400);
     VmWrite64 (VMCS_GUEST_EFER, AsmReadMsr64 (IA32_EFER_MSR));
-    VmWrite64 (VMCS_CR0_GUEST_HOST_MASK, 0);
-    VmWrite64 (VMCS_CR0_READ_SHADOW, 0);
-    VmWrite64 (VMCS_CR4_GUEST_HOST_MASK, 0x2000);
+    /*
+     * Intercept CR0/CR4 through read shadows so the guest's requested state
+     * is preserved while VMX fixed bits and CR4.VMXE remain host-owned.
+     */
+    VmWrite64 (VMCS_CR0_GUEST_HOST_MASK, MAX_UINT64);
+    VmWrite64 (VMCS_CR0_READ_SHADOW, AsmReadCr0 ());
+    VmWrite64 (VMCS_CR4_GUEST_HOST_MASK, MAX_UINT64);
     VmWrite64 (VMCS_CR4_READ_SHADOW, AsmReadCr4 () & ~0x2000ULL);
 
     VmWrite64 (VMCS_HOST_CR0, AsmReadCr0 ());
@@ -832,30 +1107,53 @@ OpbSetupCurrentCore (
     /* Capability-correct controls: (requested | allowed-0) & allowed-1. */
     RevisionId = AsmReadMsr64 (IA32_VMX_BASIC_MSR);
     if (RevisionId & (1ULL << 55)) {
-        PinControls = OpbAdjustControls (PINCTRL_NMI_EXIT, 0x48D);
+        PinControls = OpbAdjustControls (
+                          PINCTRL_EXTINT_EXIT | PINCTRL_NMI_EXIT |
+                          PINCTRL_VIRTUAL_NMI, 0x48D);
         ProcControls = OpbAdjustControls (
                          EXECCTRL_CPUID_EXIT |
+                         EXECCTRL_HLT_EXIT |
+                         EXECCTRL_INVLPG_EXIT |
+                         EXECCTRL_CR3_LOAD_EXIT |
+                         EXECCTRL_CR3_STORE_EXIT |
+                         EXECCTRL_CR8_LOAD_EXIT |
+                         EXECCTRL_CR8_STORE_EXIT |
+                         EXECCTRL_MOV_DR_EXIT |
                          EXECCTRL_USE_MSR_BITMAP |
                          EXECCTRL_USE_IO_BITMAPS |
                          EXECCTRL_ACTIVATE_SECONDARY,
                          0x48E);
-        ExitControls = OpbAdjustControls (EXITCTRL_HOST_64BIT, 0x48F);
+        ExitControls = OpbAdjustControls (
+                          EXITCTRL_HOST_64BIT | EXITCTRL_ACK_INTERRUPT, 0x48F);
         EntryControls = OpbAdjustControls (ENTRYCTRL_LONG_MODE_GUEST, 0x490);
     } else {
-        PinControls = OpbAdjustControls (PINCTRL_NMI_EXIT, 0x481);
+        PinControls = OpbAdjustControls (
+                          PINCTRL_EXTINT_EXIT | PINCTRL_NMI_EXIT |
+                          PINCTRL_VIRTUAL_NMI, 0x481);
         ProcControls = OpbAdjustControls (
                          EXECCTRL_CPUID_EXIT |
+                         EXECCTRL_HLT_EXIT |
+                         EXECCTRL_INVLPG_EXIT |
+                         EXECCTRL_CR3_LOAD_EXIT |
+                         EXECCTRL_CR3_STORE_EXIT |
+                         EXECCTRL_CR8_LOAD_EXIT |
+                         EXECCTRL_CR8_STORE_EXIT |
+                         EXECCTRL_MOV_DR_EXIT |
                          EXECCTRL_USE_MSR_BITMAP |
                          EXECCTRL_USE_IO_BITMAPS |
                          EXECCTRL_ACTIVATE_SECONDARY,
                          0x482);
-        ExitControls = OpbAdjustControls (EXITCTRL_HOST_64BIT, 0x483);
+        ExitControls = OpbAdjustControls (
+                          EXITCTRL_HOST_64BIT | EXITCTRL_ACK_INTERRUPT, 0x483);
         EntryControls = OpbAdjustControls (ENTRYCTRL_LONG_MODE_GUEST, 0x484);
     }
     Proc2Controls = OpbAdjustControls (PROC2_ENABLE_EPT, 0x48B);
-    if (!(ProcControls & EXECCTRL_ACTIVATE_SECONDARY) ||
+    if (!(PinControls & PINCTRL_EXTINT_EXIT) ||
+        !(PinControls & PINCTRL_NMI_EXIT) ||
+        !(ProcControls & EXECCTRL_ACTIVATE_SECONDARY) ||
         !(Proc2Controls & PROC2_ENABLE_EPT) ||
-        !(ProcControls & EXECCTRL_CPUID_EXIT)) {
+        !(ProcControls & EXECCTRL_CPUID_EXIT) ||
+        !(ExitControls & EXITCTRL_ACK_INTERRUPT)) {
         return EFI_UNSUPPORTED;
     }
 
@@ -898,6 +1196,8 @@ OpbSetupCurrentCore (
     VmWrite64 (VMCS_GUEST_RFLAGS,
                 *(UINT64 *)((UINT8 *)GuestStack + 0x98));
 
+    Vcpu->guest_cr8 = 0;
+    Vcpu->active = TRUE;
     Vcpu->launched = TRUE;
     return EFI_SUCCESS;
 }
