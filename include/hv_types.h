@@ -40,6 +40,7 @@ typedef struct _GUEST_REGS {
 
 typedef struct _VMX_VMXOFF_STATE {
     BOOLEAN executed;
+    BOOLEAN handoff;
     UINT64  guest_rip;
     UINT64  guest_rsp;
     UINT64  guest_cr3;
@@ -67,15 +68,34 @@ typedef struct _VMM_EPT_DYNAMIC_SPLIT {
         PEPT_PML2_ENTRY   Entry;
         PEPT_PML2_POINTER Pointer;
     } u;
+    UINT64 OriginalEntry;
     LIST_ENTRY SplitList;
 } VMM_EPT_DYNAMIC_SPLIT, *PVMM_EPT_DYNAMIC_SPLIT;
+
+typedef enum _EPT_MMIO_KIND {
+    EptMmioNone,
+    EptMmioHpet,
+    EptMmioLapic
+} EPT_MMIO_KIND;
+
+typedef struct _EPT_MMIO_HOOK {
+    BOOLEAN        active;
+    EPT_MMIO_KIND  kind;
+    UINT16         target_offset;
+    UINT16         target_size;
+    UINT64         physical_page;
+    UINT64         shadow_va;
+    UINT64         shadow_pa;
+    UINT64         original_entry;
+    PEPT_PML1_ENTRY entry;
+} EPT_MMIO_HOOK, *PEPT_MMIO_HOOK;
 
 typedef struct _EPT_STATE {
     MTRR_RANGE_DESCRIPTOR mem_ranges[MAX_MTRR_RANGES];
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
-    LIST_ENTRY            hooked_pages;    // reserved for future EPT hooks
+    LIST_ENTRY            hooked_pages;    // owns dynamic EPT split allocations
 
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)
@@ -85,6 +105,11 @@ typedef struct _EPT_STATE {
     BOOLEAN               invvpid_single_context;
     BOOLEAN               invvpid_all_contexts;
     BOOLEAN               invvpid_single_retaining_globals;
+    BOOLEAN               mtf_supported;
+    BOOLEAN               hpet_counter_64bit;
+    UINT64                hpet_physical;
+    UINT64                hpet_period_fs;
+    UINT64                tsc_frequency;
 } EPT_STATE, *PEPT_STATE;
 
 typedef struct _VIRTUAL_MACHINE_STATE {
@@ -116,6 +141,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     UINT64      vmexit_rip;
     BOOLEAN     in_root;
     BOOLEAN     launched;
+    BOOLEAN     vmxon_active;
+    BOOLEAN     detached;
+    BOOLEAN     waitpkg_enabled;
     BOOLEAN     advance_rip;
 
     VMX_VMXOFF_STATE vmxoff;
@@ -128,6 +156,47 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     //
     UINT64  tsc_cpuid_entry;        // TSC recorded at start of CPUID VM-exit handler
     BOOLEAN tsc_rdtsc_armed;        // TRUE = next RDTSC/RDTSCP should be compensated
+
+    //
+    // PMU virtualization. PERF_GLOBAL_CTRL is loaded as zero on VM-exit and
+    // restored from the guest VMCS field on entry. APERF/MPERF biases remove
+    // the exact root-mode deltas sampled at handler entry/exit.
+    //
+    BOOLEAN pmu_isolated;
+    BOOLEAN aperf_mperf_supported;
+    UINT8   pmu_version;
+    UINT8   pmu_gp_count;
+    UINT8   pmu_gp_width;
+    UINT8   pmu_fixed_count;
+    UINT8   pmu_fixed_width;
+    UINT32  pmu_fixed_bitmap;
+    UINT64  perf_global_ctrl;
+    UINT64  aperf_root_entry;
+    UINT64  mperf_root_entry;
+    UINT64  aperf_root_bias;
+    UINT64  mperf_root_bias;
+    UINT64  aperf_guest_offset;
+    UINT64  mperf_guest_offset;
+
+    //
+    // Per-vCPU timer MMIO state. A permission fault temporarily maps either
+    // the shadow page or the real MMIO page; MTF restores the trap after the
+    // retried instruction.
+    //
+    EPT_MMIO_HOOK hpet_hook;
+    EPT_MMIO_HOOK lapic_hook;
+    PVOID   hpet_va;
+    UINT64  root_tsc_entry;
+    UINT64  root_tsc_bias;
+    BOOLEAN timer_bias_pending;
+    UINT64  hpet_last_value;
+    PEPT_MMIO_HOOK mtf_hook;
+    PVOID   lapic_va;
+    BOOLEAN x2apic_enabled;
+    UINT32  lapic_root_entry;
+    UINT64  lapic_root_bias;
+    UINT32  lapic_initial_count;
+    UINT32  lapic_last_value;
 
     //
     // pending external interrupt for deferred re-injection

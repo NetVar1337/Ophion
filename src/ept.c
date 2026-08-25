@@ -4,20 +4,124 @@
 *   architecture: pml4 -> pml3 -> pml2 (2mb large pages)
 */
 #include "hv.h"
+#include <aux_klib.h>
+
+#pragma comment(lib, "Aux_Klib.lib")
+
+#define ACPI_PROVIDER_SIGNATURE 'IPCA'
+#define ACPI_HPET_SIGNATURE     'TEPH'
+
+#pragma pack(push, 1)
+typedef struct _HV_ACPI_TABLE_HEADER {
+    UINT32 Signature;
+    UINT32 Length;
+    UINT8  Revision;
+    UINT8  Checksum;
+    UINT8  OemId[6];
+    UINT8  OemTableId[8];
+    UINT32 OemRevision;
+    UINT32 AslCompilerId;
+    UINT32 AslCompilerRevision;
+} HV_ACPI_TABLE_HEADER;
+
+typedef struct _HV_ACPI_GAS {
+    UINT8  AddressSpaceId;
+    UINT8  RegisterBitWidth;
+    UINT8  RegisterBitOffset;
+    UINT8  AccessSize;
+    UINT64 Address;
+} HV_ACPI_GAS;
+
+typedef struct _HV_ACPI_HPET {
+    HV_ACPI_TABLE_HEADER Header;
+    UINT32               EventTimerBlockId;
+    HV_ACPI_GAS          BaseAddress;
+    UINT8                Sequence;
+    UINT16               MinimumTick;
+    UINT8                Flags;
+} HV_ACPI_HPET;
+#pragma pack(pop)
+
+static UINT64
+ept_query_tsc_frequency(VOID)
+{
+    INT32 cpu_info[4] = {0};
+    UINT64 frequency = 0;
+
+    __cpuidex(cpu_info, 0x15, 0);
+    if (cpu_info[0] && cpu_info[1] && cpu_info[2])
+        frequency = ((UINT64)(UINT32)cpu_info[2] * (UINT32)cpu_info[1]) /
+                    (UINT32)cpu_info[0];
+
+    if (!frequency)
+    {
+        __cpuidex(cpu_info, 0x16, 0);
+        if (cpu_info[0])
+            frequency = (UINT64)(UINT32)cpu_info[0] * 1000000ULL;
+    }
+
+    return frequency;
+}
+
+static UINT64
+ept_query_hpet(VOID)
+{
+    NTSTATUS status;
+    ULONG size = 0;
+    HV_ACPI_HPET * table;
+    UINT64 address = 0;
+
+    status = AuxKlibInitialize();
+    if (!NT_SUCCESS(status))
+        return 0;
+
+    status = AuxKlibGetSystemFirmwareTable(
+        ACPI_PROVIDER_SIGNATURE, ACPI_HPET_SIGNATURE, NULL, 0, &size);
+    if (status != STATUS_BUFFER_TOO_SMALL || size < sizeof(HV_ACPI_HPET))
+        return 0;
+
+    table = (HV_ACPI_HPET *)ExAllocatePool2(POOL_FLAG_NON_PAGED, size, HV_POOL_TAG);
+    if (!table)
+        return 0;
+
+    status = AuxKlibGetSystemFirmwareTable(
+        ACPI_PROVIDER_SIGNATURE, ACPI_HPET_SIGNATURE, table, size, &size);
+    if (NT_SUCCESS(status) &&
+        table->Header.Signature == ACPI_HPET_SIGNATURE &&
+        table->BaseAddress.AddressSpaceId == 0)
+    {
+        address = table->BaseAddress.Address;
+    }
+
+    ExFreePoolWithTag(table, HV_POOL_TAG);
+    return address;
+}
 
 BOOLEAN
 ept_check_features(VOID)
 {
     IA32_VMX_EPT_VPID_CAP_REGISTER vpid_reg;
     IA32_MTRR_DEF_TYPE_REGISTER    mtrr_def;
+    IA32_VMX_BASIC_REGISTER        vmx_basic;
+    MSR                            proc_controls;
 
     vpid_reg.AsUInt = __readmsr(IA32_VMX_EPT_VPID_CAP);
-    mtrr_def.AsUInt  = __readmsr(IA32_MTRR_DEF_TYPE);
+    mtrr_def.AsUInt = __readmsr(IA32_MTRR_DEF_TYPE);
+    vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
+    proc_controls.Flags = __readmsr(
+        vmx_basic.VmxControls
+            ? IA32_VMX_TRUE_PROCBASED_CTLS
+            : IA32_VMX_PROCBASED_CTLS);
+    g_ept->mtf_supported =
+        (proc_controls.Fields.High &
+         CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG) != 0;
 
     if (!vpid_reg.PageWalkLength4 || !vpid_reg.MemoryTypeWriteBack || !vpid_reg.Pde2MbPages)
     {
         DbgPrintEx(0, 0, "[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
-                 vpid_reg.PageWalkLength4, vpid_reg.MemoryTypeWriteBack, vpid_reg.Pde2MbPages);
+                 (int)vpid_reg.PageWalkLength4,
+                 (int)vpid_reg.MemoryTypeWriteBack,
+                 (int)vpid_reg.Pde2MbPages);
         return FALSE;
     }
 
@@ -298,13 +402,38 @@ ept_init(VOID)
         return FALSE;
 
     RtlZeroMemory(g_ept, sizeof(EPT_STATE));
-
     InitializeListHead(&g_ept->hooked_pages);
 
-    if (!ept_check_features())
-        return FALSE;
+    g_ept->tsc_frequency = ept_query_tsc_frequency();
+    g_ept->hpet_physical = ept_query_hpet();
+    if (g_ept->hpet_physical)
+    {
+        PHYSICAL_ADDRESS hpet_pa;
+        volatile UINT64 * hpet;
 
-    if (!ept_build_mtrr_map())
+        hpet_pa.QuadPart = g_ept->hpet_physical & ~(UINT64)(PAGE_SIZE - 1);
+        hpet = (volatile UINT64 *)MmMapIoSpaceEx(
+            hpet_pa, PAGE_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+        if (hpet)
+        {
+            UINT64 capabilities =
+                hpet[HPET_GENERAL_CAPABILITIES / sizeof(UINT64)];
+            UINT64 period_fs = capabilities >> 32;
+
+            if ((capabilities & 0xFF) &&
+                period_fs && period_fs <= 0x05F5E100ULL)
+            {
+                g_ept->hpet_period_fs = period_fs;
+                g_ept->hpet_counter_64bit =
+                    (capabilities & (1ULL << 13)) != 0;
+            }
+            MmUnmapIoSpace((PVOID)hpet, PAGE_SIZE);
+        }
+        if (!g_ept->hpet_period_fs)
+            g_ept->hpet_physical = 0;
+    }
+
+    if (!ept_check_features() || !ept_build_mtrr_map())
         return FALSE;
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -318,16 +447,10 @@ ept_init(VOID)
 
         g_vcpu[i].ept_page_table = page_table;
 
-        //
-        // build EPT pointer
-        // memory type for EPT paging structures = WB (most efficient, validated
-        // by ept_check_features checking memoryTypeWriteBack capability).
-        //
-        eptp.MemoryType               = MEMORY_TYPE_WRITE_BACK;
+        eptp.MemoryType = MEMORY_TYPE_WRITE_BACK;
         eptp.EnableAccessAndDirtyFlags = g_ept->ad_supported;
-        eptp.PageWalkLength           = 3;  // 4-level walk (value = levels - 1)
-        eptp.PageFrameNumber          = va_to_pa(&page_table->PML4) / PAGE_SIZE;
-
+        eptp.PageWalkLength = 3;
+        eptp.PageFrameNumber = va_to_pa(&page_table->PML4) / PAGE_SIZE;
         g_vcpu[i].ept_pointer = eptp;
     }
 
@@ -335,51 +458,52 @@ ept_init(VOID)
     return TRUE;
 }
 
-/*
-*   split a 2mb page into 512 4kb pages (for ept hooks)
-*   placeholder — implement when you need fine-grained memory control
-*/
 BOOLEAN
-ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
+ept_split_large_page(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T phys_addr)
 {
+    PHYSICAL_ADDRESS max_phys;
     PEPT_PML2_ENTRY target;
     PVMM_EPT_DYNAMIC_SPLIT new_split;
     EPT_PML1_ENTRY entry_tmpl;
     EPT_PML2_POINTER new_ptr;
 
-    target = ept_get_pml2(page_table, phys_addr);
-    if (!target || !target->LargePage)
+    target = ept_get_pml2(vcpu->ept_page_table, phys_addr);
+    if (!target)
         return FALSE;
+    if (!target->LargePage)
+        return TRUE;
 
-    new_split = (PVMM_EPT_DYNAMIC_SPLIT)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(VMM_EPT_DYNAMIC_SPLIT), HV_POOL_TAG);
+    max_phys.QuadPart = MAXULONG64;
+    new_split = (PVMM_EPT_DYNAMIC_SPLIT)MmAllocateContiguousMemory(
+        sizeof(VMM_EPT_DYNAMIC_SPLIT), max_phys);
     if (!new_split)
         return FALSE;
 
     RtlZeroMemory(new_split, sizeof(VMM_EPT_DYNAMIC_SPLIT));
     new_split->u.Entry = target;
+    new_split->OriginalEntry = target->AsUInt;
 
-    entry_tmpl.AsUInt        = 0;
-    entry_tmpl.ReadAccess    = 1;
-    entry_tmpl.WriteAccess   = 1;
+    entry_tmpl.AsUInt = 0;
+    entry_tmpl.ReadAccess = 1;
+    entry_tmpl.WriteAccess = 1;
     entry_tmpl.ExecuteAccess = 1;
-
     __stosq((SIZE_T *)&new_split->PML1[0], entry_tmpl.AsUInt, VMM_EPT_PML1E_COUNT);
 
     for (SIZE_T i = 0; i < VMM_EPT_PML1E_COUNT; i++)
     {
-        new_split->PML1[i].PageFrameNumber = ((target->PageFrameNumber * SIZE_2_MB) / PAGE_SIZE) + i;
-        new_split->PML1[i].MemoryType      = ept_get_memory_type(new_split->PML1[i].PageFrameNumber, FALSE);
+        new_split->PML1[i].PageFrameNumber =
+            ((target->PageFrameNumber * SIZE_2_MB) / PAGE_SIZE) + i;
+        new_split->PML1[i].MemoryType =
+            ept_get_memory_type(new_split->PML1[i].PageFrameNumber, FALSE);
     }
 
-    new_ptr.AsUInt            = 0;
-    new_ptr.ReadAccess        = 1;
-    new_ptr.WriteAccess       = 1;
-    new_ptr.ExecuteAccess     = 1;
-    new_ptr.PageFrameNumber   = va_to_pa(&new_split->PML1[0]) / PAGE_SIZE;
-
+    new_ptr.AsUInt = 0;
+    new_ptr.ReadAccess = 1;
+    new_ptr.WriteAccess = 1;
+    new_ptr.ExecuteAccess = 1;
+    new_ptr.PageFrameNumber = va_to_pa(&new_split->PML1[0]) / PAGE_SIZE;
     RtlCopyMemory(target, &new_ptr, sizeof(new_ptr));
-
+    InsertTailList(&g_ept->hooked_pages, &new_split->SplitList);
     return TRUE;
 }
 
@@ -444,4 +568,299 @@ vpid_invvpid_single(UINT16 vpid)
     INVVPID_DESCRIPTOR desc = {0};
     desc.Vpid = vpid;
     asm_invvpid(InvvpidSingleContext, &desc);
+}
+
+static UINT64
+ept_mul_div_u64(UINT64 value, UINT64 multiplier, UINT64 divisor)
+{
+    UINT64 quotient;
+    UINT64 remainder;
+
+    if (!divisor)
+        return 0;
+
+    quotient = value / divisor;
+    remainder = value % divisor;
+    if (quotient > MAXULONG64 / multiplier)
+        return MAXULONG64;
+    return quotient * multiplier + (remainder * multiplier) / divisor;
+}
+
+static BOOLEAN
+ept_create_mmio_hook(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    PEPT_MMIO_HOOK hook,
+    EPT_MMIO_KIND kind,
+    UINT64 physical,
+    UINT16 target_offset,
+    UINT16 target_size)
+{
+    PHYSICAL_ADDRESS max_phys;
+
+    if (!ept_split_large_page(vcpu, physical))
+        return FALSE;
+
+    hook->entry = ept_get_pml1(vcpu->ept_page_table, physical);
+    if (!hook->entry)
+        return FALSE;
+
+    max_phys.QuadPart = MAXULONG64;
+    hook->shadow_va = (UINT64)MmAllocateContiguousMemory(PAGE_SIZE, max_phys);
+    if (!hook->shadow_va)
+        return FALSE;
+
+    RtlZeroMemory((PVOID)hook->shadow_va, PAGE_SIZE);
+    hook->kind = kind;
+    hook->physical_page = physical & ~(UINT64)(PAGE_SIZE - 1);
+    hook->target_offset = target_offset;
+    hook->target_size = target_size;
+    hook->shadow_pa = va_to_pa((PVOID)hook->shadow_va);
+    hook->original_entry = hook->entry->AsUInt;
+    hook->entry->ReadAccess = 0;
+    hook->entry->WriteAccess = 0;
+    hook->entry->ExecuteAccess = 0;
+    hook->active = TRUE;
+    return TRUE;
+}
+
+BOOLEAN
+ept_setup_timer_hooks(VOID)
+{
+#if STEALTH_VIRTUALIZE_TIMERS
+    UINT64 apic_base = __readmsr(IA32_APIC_BASE);
+    BOOLEAN apic_enabled = (apic_base & IA32_APIC_BASE_ENABLE) != 0;
+    BOOLEAN x2apic = (apic_base & IA32_APIC_BASE_X2APIC) != 0;
+    UINT64 apic_physical = apic_base & IA32_APIC_BASE_ADDRESS_MASK;
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+        g_vcpu[i].x2apic_enabled = apic_enabled && x2apic;
+
+    if (!g_ept->mtf_supported)
+    {
+        DbgPrintEx(0, 0,
+            "[hv] Timer MMIO virtualization disabled: MTF unavailable\n");
+        return TRUE;
+    }
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
+        vcpu->x2apic_enabled = apic_enabled && x2apic;
+
+        if (g_ept->hpet_physical)
+        {
+            PHYSICAL_ADDRESS pa;
+            pa.QuadPart = g_ept->hpet_physical & ~(UINT64)(PAGE_SIZE - 1);
+            vcpu->hpet_va = MmMapIoSpaceEx(
+                pa, PAGE_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+            if (!vcpu->hpet_va ||
+                !ept_create_mmio_hook(
+                    vcpu, &vcpu->hpet_hook, EptMmioHpet,
+                    g_ept->hpet_physical,
+                    (UINT16)((g_ept->hpet_physical & (PAGE_SIZE - 1)) +
+                             HPET_MAIN_COUNTER),
+                    sizeof(UINT64)))
+            {
+                DbgPrintEx(0, 0,
+                    "[hv] HPET virtualization unavailable; continuing without MMIO timing hooks\n");
+                ept_destroy_timer_hooks();
+                return TRUE;
+            }
+        }
+
+        if (apic_enabled && !x2apic)
+        {
+            PHYSICAL_ADDRESS pa;
+            pa.QuadPart = apic_physical;
+            vcpu->lapic_va = MmMapIoSpaceEx(
+                pa, PAGE_SIZE, PAGE_READWRITE | PAGE_NOCACHE);
+            if (!vcpu->lapic_va ||
+                !ept_create_mmio_hook(
+                    vcpu, &vcpu->lapic_hook, EptMmioLapic,
+                    apic_physical, XAPIC_CURRENT_COUNT_OFFSET, sizeof(UINT32)))
+            {
+                DbgPrintEx(0, 0,
+                    "[hv] xAPIC virtualization unavailable; continuing without MMIO timing hooks\n");
+                ept_destroy_timer_hooks();
+                return TRUE;
+            }
+        }
+    }
+#endif
+    return TRUE;
+}
+
+BOOLEAN
+ept_handle_mmio_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys)
+{
+    PEPT_MMIO_HOOK hook = NULL;
+    VMX_EXIT_QUALIFICATION_EPT_VIOLATION qual;
+    UINT16 offset = (UINT16)(guest_phys & (PAGE_SIZE - 1));
+    BOOLEAN target_read;
+
+    if (vcpu->hpet_hook.active &&
+        (guest_phys & ~(UINT64)(PAGE_SIZE - 1)) == vcpu->hpet_hook.physical_page)
+        hook = &vcpu->hpet_hook;
+    else if (vcpu->lapic_hook.active &&
+             (guest_phys & ~(UINT64)(PAGE_SIZE - 1)) == vcpu->lapic_hook.physical_page)
+        hook = &vcpu->lapic_hook;
+    else
+        return FALSE;
+
+    qual.AsUInt = vcpu->exit_qual;
+    target_read = qual.ReadAccess &&
+        offset >= hook->target_offset &&
+        offset < hook->target_offset + hook->target_size;
+
+    hook->entry->AsUInt = hook->original_entry;
+    if (target_read)
+    {
+        if (hook->kind == EptMmioHpet)
+        {
+            UINT64 raw = *(volatile UINT64 *)((PUCHAR)vcpu->hpet_va +
+                                              hook->target_offset);
+            UINT64 total_bias = vcpu->timer_bias_pending
+                ? vcpu->root_tsc_bias +
+                  (__rdtsc() - vcpu->root_tsc_entry)
+                : 0;
+            BOOLEAN enabled =
+                (*(volatile UINT64 *)(
+                    (PUCHAR)vcpu->hpet_va + HPET_GENERAL_CONFIGURATION) & 1) != 0;
+
+            if (!g_ept->hpet_counter_64bit)
+                raw = (UINT32)raw;
+
+            if (enabled)
+            {
+                UINT64 root_ticks = 0;
+
+
+                if (g_ept->tsc_frequency && g_ept->hpet_period_fs)
+                {
+                    UINT64 root_ns = ept_mul_div_u64(
+                        total_bias,
+                        1000000000ULL, g_ept->tsc_frequency);
+                    root_ticks = ept_mul_div_u64(
+                        root_ns, 1000000ULL, g_ept->hpet_period_fs);
+                }
+
+                if (g_ept->hpet_counter_64bit)
+                {
+                    raw = raw > root_ticks ? raw - root_ticks : 0;
+                    if (raw < vcpu->hpet_last_value)
+                        raw = vcpu->hpet_last_value;
+                }
+                else
+                {
+                    raw = (UINT32)((UINT32)raw - (UINT32)root_ticks);
+                }
+            }
+
+            vcpu->hpet_last_value = raw;
+            *(UINT64 *)((PUCHAR)hook->shadow_va + hook->target_offset) = raw;
+        }
+        else
+        {
+            UINT32 raw = *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va +
+                                              XAPIC_CURRENT_COUNT_OFFSET);
+            UINT32 initial = *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va +
+                                                  XAPIC_INITIAL_COUNT_OFFSET);
+            UINT64 adjusted;
+
+            if (initial != vcpu->lapic_initial_count)
+            {
+                vcpu->lapic_initial_count = initial;
+                vcpu->lapic_root_bias = 0;
+            }
+            adjusted = raw;
+            if (vcpu->timer_bias_pending)
+            {
+                adjusted += vcpu->lapic_root_bias;
+                if (vcpu->lapic_root_entry >= raw)
+                    adjusted += vcpu->lapic_root_entry - raw;
+            }
+            if (adjusted > initial)
+                adjusted = initial;
+            vcpu->lapic_last_value = (UINT32)adjusted;
+            *(UINT32 *)((PUCHAR)hook->shadow_va + hook->target_offset) =
+                (UINT32)adjusted;
+        }
+        vcpu->timer_bias_pending = FALSE;
+        hook->entry->PageFrameNumber = hook->shadow_pa / PAGE_SIZE;
+    }
+
+    if (!target_read && qual.WriteAccess &&
+        hook->kind == EptMmioHpet &&
+        offset >= hook->target_offset &&
+        offset < hook->target_offset + hook->target_size)
+    {
+        vcpu->hpet_last_value = 0;
+    }
+
+    hook->entry->ReadAccess = 1;
+    hook->entry->WriteAccess = target_read ? 0 : 1;
+    hook->entry->ExecuteAccess = 0;
+    vcpu->mtf_hook = hook;
+
+    {
+        size_t controls = 0;
+        __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &controls);
+        controls |= CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+        __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, controls);
+    }
+    ept_invept_single(vcpu->ept_pointer);
+    return TRUE;
+}
+
+VOID
+ept_handle_monitor_trap(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    size_t controls = 0;
+
+    if (vcpu->mtf_hook)
+    {
+        vcpu->mtf_hook->entry->AsUInt = vcpu->mtf_hook->original_entry;
+        vcpu->mtf_hook->entry->ReadAccess = 0;
+        vcpu->mtf_hook->entry->WriteAccess = 0;
+        vcpu->mtf_hook->entry->ExecuteAccess = 0;
+        vcpu->mtf_hook = NULL;
+        ept_invept_single(vcpu->ept_pointer);
+    }
+
+    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &controls);
+    controls &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG;
+    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, controls);
+}
+
+VOID
+ept_destroy_timer_hooks(VOID)
+{
+    if (!g_ept)
+        return;
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
+        if (vcpu->hpet_hook.shadow_va)
+            MmFreeContiguousMemory((PVOID)vcpu->hpet_hook.shadow_va);
+        if (vcpu->lapic_hook.shadow_va)
+            MmFreeContiguousMemory((PVOID)vcpu->lapic_hook.shadow_va);
+        if (vcpu->hpet_va)
+            MmUnmapIoSpace(vcpu->hpet_va, PAGE_SIZE);
+        if (vcpu->lapic_va)
+            MmUnmapIoSpace(vcpu->lapic_va, PAGE_SIZE);
+        RtlZeroMemory(&vcpu->hpet_hook, sizeof(vcpu->hpet_hook));
+        RtlZeroMemory(&vcpu->lapic_hook, sizeof(vcpu->lapic_hook));
+        vcpu->hpet_va = NULL;
+        vcpu->lapic_va = NULL;
+    }
+
+    while (!IsListEmpty(&g_ept->hooked_pages))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&g_ept->hooked_pages);
+        PVMM_EPT_DYNAMIC_SPLIT split =
+            CONTAINING_RECORD(entry, VMM_EPT_DYNAMIC_SPLIT, SplitList);
+        split->u.Entry->AsUInt = split->OriginalEntry;
+        MmFreeContiguousMemory(split);
+    }
 }

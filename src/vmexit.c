@@ -145,6 +145,98 @@ should_generate_df(UINT32 first_vector, UINT32 second_vector)
     return FALSE;
 }
 
+static __forceinline UINT64
+pmu_width_mask(UINT8 width)
+{
+    if (width >= 64)
+        return MAXULONG64;
+    if (!width)
+        return 0;
+    return (1ULL << width) - 1;
+}
+
+static __forceinline UINT64
+pmu_global_control_mask(const VIRTUAL_MACHINE_STATE * vcpu)
+{
+    UINT64 gp_mask = vcpu->pmu_gp_count >= 32
+        ? 0xFFFFFFFFULL
+        : ((1ULL << vcpu->pmu_gp_count) - 1);
+    UINT64 fixed_mask = (vcpu->pmu_fixed_count >= 32
+        ? 0xFFFFFFFFULL
+        : ((1ULL << vcpu->pmu_fixed_count) - 1)) |
+        vcpu->pmu_fixed_bitmap;
+
+    return gp_mask | (fixed_mask << 32);
+}
+
+static BOOLEAN
+pmu_guest_can_read(VOID)
+{
+    size_t guest_cr0 = 0;
+    size_t guest_cr4 = 0;
+    size_t guest_cs_ar = 0;
+
+    __vmx_vmread(VMCS_GUEST_CR0, &guest_cr0);
+    if (!(guest_cr0 & 1))
+        return TRUE;
+
+    __vmx_vmread(VMCS_GUEST_CR4, &guest_cr4);
+    __vmx_vmread(VMCS_GUEST_CS_ACCESS_RIGHTS, &guest_cs_ar);
+    return (((guest_cs_ar >> 5) & 3) == 0) ||
+           ((guest_cr4 & CR4_PERFORMANCE_MONITOR_COUNTER_ENABLE) != 0);
+}
+
+static BOOLEAN
+parent_hyperv_msr_supported(UINT32 msr, BOOLEAN write)
+{
+    UINT32 features = g_stealth_cpuid_cache.parent_hyperv_features;
+
+    if (!g_stealth_cpuid_cache.parent_is_hyperv)
+        return FALSE;
+
+    switch (msr)
+    {
+    case 0x40000000:
+    case 0x40000001:
+        return (features & (1U << 5)) != 0;
+    case 0x40000002:
+        return !write && (features & (1U << 6));
+    case 0x40000003:
+        return write && (features & (1U << 7));
+    case 0x40000010:
+        return !write && (features & (1U << 0));
+    case 0x40000020:
+        return !write && (features & (1U << 1));
+    case 0x40000021:
+        return (features & (1U << 9)) != 0;
+    case 0x40000022:
+    case 0x40000023:
+        return !write && (features & (1U << 11));
+    case 0x40000070:
+        return write && (features & (1U << 4));
+    case 0x40000071:
+    case 0x40000072:
+    case 0x40000073:
+        return (features & (1U << 4)) != 0;
+    case 0x40000080:
+    case 0x40000082:
+    case 0x40000083:
+        return (features & (1U << 2)) != 0;
+    case 0x40000081:
+        return !write && (features & (1U << 2));
+    case 0x40000084:
+        return write && (features & (1U << 2));
+    case 0x400000F0:
+        return write && (features & (1U << 10));
+    default:
+        if (msr >= 0x40000090 && msr <= 0x4000009F)
+            return (features & (1U << 2)) != 0;
+        if (msr >= 0x400000B0 && msr <= 0x400000B7)
+            return (features & (1U << 3)) != 0;
+        return FALSE;
+    }
+}
+
 UINT64
 vmx_return_rsp_for_vmxoff(VOID)
 {
@@ -159,6 +251,69 @@ vmx_return_rip_for_vmxoff(VOID)
     UINT32                  core_id = (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
     VIRTUAL_MACHINE_STATE * vcpu   = &g_vcpu[core_id];
     return vcpu->vmxoff.guest_rip;
+}
+
+#define VMXOFF_SAVED_RFLAGS_OFFSET 0x190
+#define VMXOFF_RETURN_RSP_OFFSET   0x1A0
+
+static VOID
+vmexit_leave_vmx(VIRTUAL_MACHINE_STATE * vcpu, UINT64 return_rip, BOOLEAN handoff)
+{
+    UINT64 guest_rsp = 0;
+    UINT64 guest_rflags = 0;
+    UINT64 guest_cr3 = 0;
+    UINT64 guest_perf = 0;
+
+    __vmx_vmread(VMCS_GUEST_RSP, &guest_rsp);
+    __vmx_vmread(VMCS_GUEST_RFLAGS, &guest_rflags);
+    __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+    if (vcpu->pmu_isolated)
+        __vmx_vmread(VMCS_GUEST_PERF_GLOBAL_CTRL, &guest_perf);
+
+    vcpu->vmxoff.guest_rip = return_rip;
+    vcpu->vmxoff.guest_rsp = guest_rsp;
+    vcpu->vmxoff.guest_cr3 = guest_cr3;
+    vcpu->vmxoff.handoff = handoff;
+
+    *(UINT64 *)(guest_rsp - sizeof(UINT64)) = return_rip;
+    *(UINT64 *)((PUCHAR)vcpu->regs + VMXOFF_SAVED_RFLAGS_OFFSET) = guest_rflags;
+    *(UINT64 *)((PUCHAR)vcpu->regs + VMXOFF_RETURN_RSP_OFFSET) =
+        guest_rsp - sizeof(UINT64);
+
+    __vmx_off();
+    vcpu->vmxon_active = FALSE;
+    vcpu->launched = FALSE;
+    vcpu->detached = handoff;
+
+    __writecr3(guest_cr3);
+
+#if USE_PRIVATE_HOST_IDT
+    if (g_host_idt.initialized)
+        asm_reload_idtr((PVOID)g_host_idt.original_idt_base,
+                        IDT_NUM_ENTRIES * sizeof(IDT_GATE_DESCRIPTOR_64) - 1);
+#endif
+
+#if USE_PRIVATE_HOST_GDT
+    if (vcpu->host_gdt)
+    {
+        PSEGMENT_DESCRIPTOR_64 tss_desc = (PSEGMENT_DESCRIPTOR_64)(
+            vcpu->original_gdt_base + (vcpu->original_tr_selector & ~0x7));
+        tss_desc->Type = TSS_TYPE_AVAILABLE_64;
+        asm_reload_gdtr((PVOID)vcpu->original_gdt_base,
+                        (UINT32)vcpu->original_gdt_limit);
+        asm_reload_tr(vcpu->original_tr_selector);
+    }
+#endif
+
+    if (vcpu->pmu_isolated)
+        __writemsr(IA32_PERF_GLOBAL_CTRL, guest_perf);
+
+    if (handoff)
+        __writecr4(__readcr4() | CR4_VMX_ENABLE_FLAG);
+    else
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+
+    vcpu->vmxoff.executed = TRUE;
 }
 
 //
@@ -190,7 +345,9 @@ vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
     // return the cached bare-metal response for perfect consistency.
     // on real hardware, CPUID(0x40000000) == CPUID(0x04201337) == CPUID(max+1)
     //
-    if (g_stealth_enabled && stealth_is_leaf_invalid(leaf))
+    if (g_stealth_enabled &&
+        !g_stealth_cpuid_cache.parent_hypervisor_present &&
+        stealth_is_leaf_invalid(leaf))
     {
         cpu_info[0] = g_stealth_cpuid_cache.invalid_leaf[0];
         cpu_info[1] = g_stealth_cpuid_cache.invalid_leaf[1];
@@ -203,13 +360,19 @@ vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
         __cpuidex(cpu_info, (int)leaf, (int)subleaf);
 
         //
-        // leaf 1: clear the hypervisor present bit (ECX[31])
-        // this is the primary detection used by EAC, BattlEye, VMAware, etc.
-        //
-        if (leaf == 1 && g_stealth_enabled)
+        // On bare metal Ophion hides only the hypervisor-present bit. VMX and
+        // every unrelated hardware feature remain native and coherent with
+        // IA32_FEATURE_CONTROL/IA32_VMX_* reporting.
+        if (leaf == CPUID_PROCESSOR_FEATURES && g_stealth_enabled &&
+            !g_stealth_cpuid_cache.parent_hypervisor_present)
         {
-            cpu_info[2] &= ~((1 << 31) | (1 << 6));
+            cpu_info[2] &= ~(INT32)HYPERV_HYPERVISOR_PRESENT_BIT;
         }
+
+        // If nested VMX does not expose the user-wait control, do not let
+        // Windows select WAITPKG instructions that cannot execute in-guest.
+        if (leaf == 7 && !vcpu->waitpkg_enabled)
+            cpu_info[2] &= ~(1 << 5);
     }
 
     regs->rax = (UINT64)cpu_info[0];
@@ -237,8 +400,17 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
     {
-        vmexit_inject_gp();
-        vcpu->advance_rip = FALSE;
+        if (parent_hyperv_msr_supported(target_msr, FALSE))
+        {
+            msr.Flags = __readmsr(target_msr);
+            regs->rax = msr.Fields.Low;
+            regs->rdx = msr.Fields.High;
+        }
+        else
+        {
+            vmexit_inject_gp();
+            vcpu->advance_rip = FALSE;
+        }
         return;
     }
 
@@ -285,7 +457,8 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             {
                 size_t tsc_offset_raw = 0;
                 __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &tsc_offset_raw);
-                msr.Flags = (UINT64)((INT64)__rdtsc() + (INT64)tsc_offset_raw);
+                msr.Flags = (UINT64)(
+                    (INT64)vcpu->root_tsc_entry + (INT64)tsc_offset_raw);
             }
             else
             {
@@ -295,24 +468,69 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
         }
 
         case IA32_FEATURE_CONTROL:
-        {
-            IA32_FEATURE_CONTROL_REGISTER feat = {0};
-            feat.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
-
-            if (g_stealth_enabled)
-            {
-                feat.Lock                      = 1;
-                feat.EnableVmxInsideSmx        = 0;
-                feat.EnableVmxOutsideSmx       = 0;
-                feat.SenterLocalFunctionEnables = 0;
-                feat.SenterGlobalEnable        = 0;
-                feat.SgxLaunchControlEnable    = 0;
-                feat.SgxGlobalEnable           = 0;
-            }
-
-            msr.Flags = feat.AsUInt;
+            msr.Flags = __readmsr(IA32_FEATURE_CONTROL);
             break;
-        }
+
+        case IA32_APERF:
+            if (!vcpu->aperf_mperf_supported)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            msr.Flags = vcpu->aperf_root_entry -
+                        vcpu->aperf_root_bias +
+                        vcpu->aperf_guest_offset;
+            break;
+
+        case IA32_MPERF:
+            if (!vcpu->aperf_mperf_supported)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            msr.Flags = vcpu->mperf_root_entry -
+                        vcpu->mperf_root_bias +
+                        vcpu->mperf_guest_offset;
+            break;
+
+        case IA32_PERF_GLOBAL_CTRL:
+            if (!vcpu->pmu_gp_count)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            msr.Flags = vcpu->perf_global_ctrl;
+            break;
+
+        case IA32_X2APIC_CUR_COUNT:
+            if (vcpu->x2apic_enabled)
+            {
+                UINT32 raw = (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
+                UINT32 initial = (UINT32)__readmsr(IA32_X2APIC_INIT_COUNT);
+                UINT64 adjusted;
+
+                if (initial != vcpu->lapic_initial_count)
+                {
+                    vcpu->lapic_initial_count = initial;
+                    vcpu->lapic_root_bias = 0;
+                }
+                adjusted = raw;
+                if (vcpu->timer_bias_pending)
+                {
+                    adjusted += vcpu->lapic_root_bias;
+                    if (vcpu->lapic_root_entry >= raw)
+                        adjusted += vcpu->lapic_root_entry - raw;
+                    vcpu->timer_bias_pending = FALSE;
+                }
+                msr.Flags = adjusted > initial ? initial : adjusted;
+                break;
+            }
+            vmexit_inject_gp();
+            vcpu->advance_rip = FALSE;
+            return;
 
         default:
             //
@@ -361,8 +579,15 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
     //
     if (target_msr >= 0x40000000 && target_msr <= 0x4FFFFFFF)
     {
-        vmexit_inject_gp();
-        vcpu->advance_rip = FALSE;
+        if (parent_hyperv_msr_supported(target_msr, TRUE))
+        {
+            __writemsr(target_msr, msr.Flags);
+        }
+        else
+        {
+            vmexit_inject_gp();
+            vcpu->advance_rip = FALSE;
+        }
         return;
     }
 
@@ -398,6 +623,41 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
 
         case IA32_FS_BASE:
             __vmx_vmwrite(VMCS_GUEST_FS_BASE, msr.Flags);
+            break;
+
+        case IA32_APERF:
+            if (!vcpu->aperf_mperf_supported)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            vcpu->aperf_guest_offset =
+                msr.Flags - (vcpu->aperf_root_entry - vcpu->aperf_root_bias);
+            break;
+
+        case IA32_MPERF:
+            if (!vcpu->aperf_mperf_supported)
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            vcpu->mperf_guest_offset =
+                msr.Flags - (vcpu->mperf_root_entry - vcpu->mperf_root_bias);
+            break;
+
+        case IA32_PERF_GLOBAL_CTRL:
+            if (!vcpu->pmu_version ||
+                (msr.Flags & ~pmu_global_control_mask(vcpu)))
+            {
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                return;
+            }
+            vcpu->perf_global_ctrl = msr.Flags;
+            if (vcpu->pmu_isolated)
+                __vmx_vmwrite(VMCS_GUEST_PERF_GLOBAL_CTRL, msr.Flags);
             break;
 
         default:
@@ -558,7 +818,7 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
                 actual &= fixed.Fields.Low;
 
                 __vmx_vmwrite(VMCS_GUEST_CR4, actual);
-                __vmx_vmwrite(VMCS_CTRL_CR4_READ_SHADOW, desired & ~CR4_VMX_ENABLE_FLAG);
+                __vmx_vmwrite(VMCS_CTRL_CR4_READ_SHADOW, desired);
             }
             else
 #endif
@@ -659,7 +919,11 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
     UINT64 guest_phys = 0;
     __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
 
-    UNREFERENCED_PARAMETER(guest_phys);
+    if (ept_handle_mmio_violation(vcpu, guest_phys))
+    {
+        vcpu->advance_rip = FALSE;
+        return;
+    }
 
     vmexit_inject_gp();
     vcpu->advance_rip = FALSE;
@@ -705,46 +969,8 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     {
         UINT64 instr_len = 0;
         __vmx_vmread(VMCS_VMEXIT_INSTRUCTION_LENGTH, &instr_len);
-
-        vcpu->vmxoff.guest_rip = vcpu->vmexit_rip + instr_len;
-        vcpu->vmxoff.guest_rsp = (UINT64)regs->rsp;
-
-        //
-        // save guest state before VMXOFF
-        //
-        UINT64 guest_cr3 = 0;
-        __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
-        vcpu->vmxoff.guest_cr3 = guest_cr3;
-
-        vcpu->vmxoff.executed = TRUE;
-
-        __vmx_off();
-
-        __writecr3(guest_cr3);
-
-#if USE_PRIVATE_HOST_IDT
-        if (g_host_idt.initialized)
-            asm_reload_idtr((PVOID)g_host_idt.original_idt_base, IDT_NUM_ENTRIES * sizeof(IDT_GATE_DESCRIPTOR_64) - 1);
-#endif
-
-#if USE_PRIVATE_HOST_GDT
-        if (vcpu->host_gdt)
-        {
-            //
-            // clear TSS busy bit before LTR, LTR on a busy TSS causes #GP
-            //
-            PSEGMENT_DESCRIPTOR_64 tss_desc = (PSEGMENT_DESCRIPTOR_64)(
-                vcpu->original_gdt_base + (vcpu->original_tr_selector & ~0x7));
-            tss_desc->Type = TSS_TYPE_AVAILABLE_64;
-
-            asm_reload_gdtr((PVOID)vcpu->original_gdt_base, (UINT32)vcpu->original_gdt_limit);
-            asm_reload_tr(vcpu->original_tr_selector);
-        }
-#endif
-
-        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
-
         regs->rax = (UINT64)STATUS_SUCCESS;
+        vmexit_leave_vmx(vcpu, vcpu->vmexit_rip + instr_len, FALSE);
         break;
     }
 
@@ -867,6 +1093,18 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->in_root     = TRUE;
     vcpu->advance_rip = TRUE;
 
+    vcpu->root_tsc_entry = __rdtsc();
+    if (vcpu->aperf_mperf_supported)
+    {
+        vcpu->aperf_root_entry = __readmsr(IA32_APERF);
+        vcpu->mperf_root_entry = __readmsr(IA32_MPERF);
+    }
+    if (vcpu->x2apic_enabled)
+        vcpu->lapic_root_entry = (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
+    else if (vcpu->lapic_va)
+        vcpu->lapic_root_entry =
+            *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va + XAPIC_CURRENT_COUNT_OFFSET);
+
     vcpu->guest_dr0 = __readdr(0);
     vcpu->guest_dr1 = __readdr(1);
     vcpu->guest_dr2 = __readdr(2);
@@ -878,6 +1116,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     __vmx_vmread(VMCS_EXIT_REASON, &exit_raw);
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
+
+    // A different exit can preempt the MTF retry window. Fail closed and
+    // let the original MMIO instruction fault/re-arm when it is retried.
+    if (vcpu->mtf_hook &&
+        exit_reason != VMX_EXIT_REASON_MONITOR_TRAP_FLAG)
+    {
+        ept_handle_monitor_trap(vcpu);
+    }
 
     //
     // TSC compensation: if RDTSC exiting was armed for compensation and this
@@ -891,6 +1137,9 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSCP)
     {
         vcpu->tsc_rdtsc_armed = FALSE;
+        vcpu->timer_bias_pending = FALSE;
+        vcpu->root_tsc_bias = 0;
+        vcpu->lapic_root_bias = 0;
 
         if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
         {
@@ -902,6 +1151,18 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     }
 #endif
 
+    if (vcpu->timer_bias_pending &&
+        !vcpu->tsc_rdtsc_armed &&
+        exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSC &&
+        exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSCP &&
+        exit_reason != VMX_EXIT_REASON_EPT_VIOLATION &&
+        exit_reason != VMX_EXIT_REASON_MONITOR_TRAP_FLAG)
+    {
+        vcpu->timer_bias_pending = FALSE;
+        vcpu->root_tsc_bias = 0;
+        vcpu->lapic_root_bias = 0;
+    }
+
     __vmx_vmread(VMCS_GUEST_RIP, &vcpu->vmexit_rip);
     __vmx_vmread(VMCS_GUEST_RSP, &vcpu->regs->rsp);
     __vmx_vmread(VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual);
@@ -910,6 +1171,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     {
     case VMX_EXIT_REASON_TRIPLE_FAULT:
         vmexit_handle_triple_fault(vcpu);
+        break;
+
+    case VMX_EXIT_REASON_EXECUTE_VMXON:
+        // Cleanly leave Ophion and retry this VMXON against the underlying
+        // hardware/L0. This is a deliberate handoff, not nested-VMCS emulation.
+        vmexit_leave_vmx(vcpu, vcpu->vmexit_rip, TRUE);
         break;
 
     //
@@ -922,7 +1189,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EXECUTE_VMRESUME:
     case VMX_EXIT_REASON_EXECUTE_VMWRITE:
     case VMX_EXIT_REASON_EXECUTE_VMXOFF:
-    case VMX_EXIT_REASON_EXECUTE_VMXON:
     case VMX_EXIT_REASON_EXECUTE_VMLAUNCH:
     case VMX_EXIT_REASON_EXECUTE_INVEPT:
     case VMX_EXIT_REASON_EXECUTE_INVVPID:
@@ -958,17 +1224,40 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EXECUTE_RDPMC:
     {
-        UINT32 counter = (UINT32)(vcpu->regs->rcx & 0xFFFFFFFF);
-        if (counter < 8 || (counter >= 0x40000000 && counter < 0x40000010))
+        UINT32 selector = (UINT32)vcpu->regs->rcx;
+        UINT16 type = (UINT16)(selector >> 16);
+        UINT16 index = (UINT16)selector;
+        UINT8 width = 0;
+        BOOLEAN valid = FALSE;
+
+        if (vcpu->pmu_version && pmu_guest_can_read())
         {
-            UINT64 val = __readpmc(counter);
-            vcpu->regs->rax = val & 0xFFFFFFFF;
-            vcpu->regs->rdx = val >> 32;
+            if (type == 0 && index < vcpu->pmu_gp_count)
+            {
+                width = vcpu->pmu_gp_width;
+                valid = width != 0;
+            }
+            else if (type == 0x4000 &&
+                     (index < vcpu->pmu_fixed_count ||
+                      (index < 32 &&
+                       (vcpu->pmu_fixed_bitmap & (1U << index)))))
+            {
+                width = vcpu->pmu_fixed_width;
+                valid = width != 0;
+            }
         }
-        else
+
+        if (!valid)
         {
             vmexit_inject_gp();
             vcpu->advance_rip = FALSE;
+            break;
+        }
+
+        {
+            UINT64 val = __readpmc(selector) & pmu_width_mask(width);
+            vcpu->regs->rax = (UINT32)val;
+            vcpu->regs->rdx = (UINT32)(val >> 32);
         }
         break;
     }
@@ -983,17 +1272,11 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         if (vcpu->tsc_rdtsc_armed)
         {
             //
-            // compensated path: return a value as if CPUID took bare-metal time.
-            // compensated = cpuid_entry_tsc + bare_metal_cost + tsc_offset
-            //
-            //   t1 (guest's previous RDTSC) < cpuid_entry_tsc (exit happened after t1)
-            //   so compensated > t1 + offset
-            //   cpuid_entry_tsc + bare_metal_cost < tsc (real time is always ahead)
-            //   so compensated < real TSC  (future native RDTSCs are safe)
+            // tsc_cpuid_entry is already offset-adjusted; expose only the
+            // native CPUID instruction cost above that timestamp.
             //
             tsc = vcpu->tsc_cpuid_entry
-                + g_stealth_cpuid_cache.bare_metal_cpuid_cost
-                + (UINT64)(INT64)offset_raw;
+                + g_stealth_cpuid_cache.bare_metal_cpuid_cost;
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
@@ -1022,15 +1305,20 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
 #if STEALTH_COMPENSATE_TIMING
         //
-        // arm RDTSC exiting for the next instruction. the timing attack
-        // pattern is RDTSC -> CPUID -> RDTSC. By trapping the next RDTSC,
-        // we can return a compensated value that hides VM-exit overhead.
-        // TSC_OFFSET is never modified — zero drift.
+        // Arm one following RDTSC/RDTSCP and retain the guest-visible CPUID
+        // entry timestamp. A separate one-shot bias is mirrored into the next
+        // HPET/LAPIC read without creating persistent per-core TSC domains.
         //
         if (g_stealth_enabled)
         {
-            vcpu->tsc_cpuid_entry = exit_tsc_start;
+            size_t offset_raw = 0;
+            __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &offset_raw);
+            vcpu->tsc_cpuid_entry = (UINT64)(
+                (INT64)exit_tsc_start + (INT64)offset_raw);
             vcpu->tsc_rdtsc_armed = TRUE;
+            vcpu->root_tsc_bias = 0;
+            vcpu->lapic_root_bias = 0;
+            vcpu->timer_bias_pending = TRUE;
 
             if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
             {
@@ -1062,6 +1350,11 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EPT_VIOLATION:
         vmexit_handle_ept_violation(vcpu);
+        break;
+
+    case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
+        ept_handle_monitor_trap(vcpu);
+        vcpu->advance_rip = FALSE;
         break;
 
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:
@@ -1289,6 +1582,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EXECUTE_PAUSE:
         break;
 
+    case VMX_EXIT_REASON_EXECUTE_UMWAIT:
+    case VMX_EXIT_REASON_EXECUTE_TPAUSE:
+        // A nested VMM may elect to exit these hints despite advertising the
+        // WAITPKG control. Consume the one exiting instruction exactly once.
+        _mm_pause();
+        break;
+
     case VMX_EXIT_REASON_EXECUTE_RDTSCP:
     {
         unsigned int aux = 0;
@@ -1300,8 +1600,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         if (vcpu->tsc_rdtsc_armed)
         {
             tsc = vcpu->tsc_cpuid_entry
-                + g_stealth_cpuid_cache.bare_metal_cpuid_cost
-                + (UINT64)(INT64)offset_raw;
+                + g_stealth_cpuid_cache.bare_metal_cpuid_cost;
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
@@ -1459,6 +1758,55 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     if (vcpu->vmxoff.executed)
         result = TRUE;
+
+    if (!vcpu->vmxoff.executed)
+    {
+        UINT64 root_delta = __rdtsc() - vcpu->root_tsc_entry;
+
+#if STEALTH_COMPENSATE_TIMING
+        if (g_stealth_enabled && vcpu->timer_bias_pending)
+        {
+            UINT64 hidden_delta = root_delta;
+
+            if (exit_reason == VMX_EXIT_REASON_EXECUTE_CPUID)
+            {
+                UINT64 native_cost =
+                    g_stealth_cpuid_cache.bare_metal_cpuid_cost;
+                hidden_delta = root_delta > native_cost
+                    ? root_delta - native_cost
+                    : 0;
+            }
+            vcpu->root_tsc_bias += hidden_delta;
+        }
+#else
+        UNREFERENCED_PARAMETER(root_delta);
+#endif
+        if (vcpu->aperf_mperf_supported)
+        {
+            vcpu->aperf_root_bias +=
+                __readmsr(IA32_APERF) - vcpu->aperf_root_entry;
+            vcpu->mperf_root_bias +=
+                __readmsr(IA32_MPERF) - vcpu->mperf_root_entry;
+        }
+        if (vcpu->timer_bias_pending)
+        {
+            if (vcpu->x2apic_enabled)
+            {
+                UINT32 current = (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
+                if (vcpu->lapic_root_entry >= current)
+                    vcpu->lapic_root_bias +=
+                        vcpu->lapic_root_entry - current;
+            }
+            else if (vcpu->lapic_va)
+            {
+                UINT32 current = *(volatile UINT32 *)(
+                    (PUCHAR)vcpu->lapic_va + XAPIC_CURRENT_COUNT_OFFSET);
+                if (vcpu->lapic_root_entry >= current)
+                    vcpu->lapic_root_bias +=
+                        vcpu->lapic_root_entry - current;
+            }
+        }
+    }
 
     vcpu->in_root = FALSE;
     return result;

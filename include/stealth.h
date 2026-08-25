@@ -18,12 +18,11 @@
 // compensate TSC for VM-exit overhead
 // defeats: hvdetecc VM::TIMER, RDTSC+CPUID+RDTSC timing attacks
 //
-// approach: after CPUID exit, dynamically enable RDTSC exiting for one
-// instruction. the trapped RDTSC returns a compensated value that hides
-// the VM-exit overhead, then RDTSC exiting is disabled. zero drift —
-// TSC_OFFSET is never modified, only one RDTSC per CPUID is trapped.
+// approach: the CPUID path traps one following RDTSC/RDTSCP and mirrors its
+// one-shot hidden residency into the next HPET/LAPIC read. No persistent
+// per-vCPU TSC offset is accumulated, avoiding cross-core clock skew.
 //
-#define STEALTH_COMPENSATE_TIMING           0
+#define STEALTH_COMPENSATE_TIMING           1
 
 //
 // use cached bare-metal CPUID for invalid/hypervisor leaves
@@ -31,12 +30,19 @@
 //
 #define STEALTH_CPUID_CACHING               1
 
+// Exclude VMX-root execution from architectural counters and compensate
+// APERF/MPERF reads with per-vCPU measured root deltas.
+#define STEALTH_VIRTUALIZE_PMU              1
+
+// Virtualize guest-visible HPET/LAPIC count reads with per-vCPU EPT shadows.
+#define STEALTH_VIRTUALIZE_TIMERS           1
+
 //
 // use private (deep-copied) host page tables for VMCS_HOST_CR3
 // protects host-mode from guest/anti-cheat page table corruption
 // disabled by default — enable once base hv is verified stable
 //
-#define USE_PRIVATE_HOST_CR3                1
+#define USE_PRIVATE_HOST_CR3                0
 
 //
 // private host IDT for VMCS_HOST_IDTR_BASE
@@ -95,6 +101,9 @@ typedef struct _STEALTH_CPUID_CACHE {
     UINT64  valid_xcr0_mask;
 
     BOOLEAN initialized;
+    BOOLEAN parent_hypervisor_present;
+    BOOLEAN parent_is_hyperv;
+    UINT32  parent_hyperv_features;
 
     //
     // calibrated bare-metal CPUID execution cost (min of N samples)

@@ -57,7 +57,14 @@ dpc_terminate_guest(
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
 
-    asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+    {
+        ULONG core = KeGetCurrentProcessorNumberEx(NULL);
+        if (g_vcpu && core < g_cpu_count &&
+            g_vcpu[core].launched && !g_vcpu[core].detached)
+        {
+            asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+        }
+    }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);

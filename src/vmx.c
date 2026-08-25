@@ -144,12 +144,7 @@ vmx_alloc_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
 BOOLEAN
 vmx_clear_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
 {
-    if (__vmx_vmclear(&vcpu->vmcs_pa))
-    {
-        __vmx_off();
-        return FALSE;
-    }
-    return TRUE;
+    return __vmx_vmclear(&vcpu->vmcs_pa) == 0;
 }
 
 BOOLEAN
@@ -165,11 +160,42 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 {
     UINT32                  pri_proc;
     UINT32                  sec_proc;
+    UINT32                  pin_ctrl;
+    UINT32                  exit_ctrl;
+    UINT32                  entry_ctrl;
     UINT64                  gdt_base;
-    IA32_VMX_BASIC_REGISTER vmx_basic     = {0};
+    INT32                   cpu_info[4] = {0};
+    IA32_VMX_BASIC_REGISTER vmx_basic = {0};
     VMX_SEGMENT_SELECTOR    seg_sel = {0};
 
     vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
+#if STEALTH_VIRTUALIZE_PMU
+    __cpuidex(cpu_info, 0x0A, 0);
+    vcpu->pmu_version = (UINT8)(cpu_info[0] & 0xFF);
+    if (vcpu->pmu_version)
+    {
+        UINT64 valid_global_mask;
+
+        vcpu->pmu_gp_count = (UINT8)((cpu_info[0] >> 8) & 0xFF);
+        vcpu->pmu_gp_width = (UINT8)((cpu_info[0] >> 16) & 0xFF);
+        vcpu->pmu_fixed_bitmap = (UINT32)cpu_info[2];
+        vcpu->pmu_fixed_count = (UINT8)(cpu_info[3] & 0x1F);
+        vcpu->pmu_fixed_width = (UINT8)((cpu_info[3] >> 5) & 0xFF);
+
+        valid_global_mask = vcpu->pmu_gp_count >= 32
+            ? 0xFFFFFFFFULL
+            : ((1ULL << vcpu->pmu_gp_count) - 1);
+        valid_global_mask |= ((vcpu->pmu_fixed_count >= 32
+            ? 0xFFFFFFFFULL
+            : ((1ULL << vcpu->pmu_fixed_count) - 1)) |
+            vcpu->pmu_fixed_bitmap) << 32;
+        vcpu->perf_global_ctrl =
+            __readmsr(IA32_PERF_GLOBAL_CTRL) & valid_global_mask;
+    }
+
+    __cpuidex(cpu_info, 6, 0);
+    vcpu->aperf_mperf_supported = ((UINT32)cpu_info[2] & 1U) != 0;
+#endif
 
     //
     // mask RPL and TI bits (bits 0-2) per Intel SDM
@@ -219,6 +245,8 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     pri_proc = vmx_adjust_controls(
         CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING |
+        (STEALTH_VIRTUALIZE_PMU
+            ? CPU_BASED_VM_EXEC_CTRL_RDPMC_EXITING : 0) |
         CPU_BASED_VM_EXEC_CTRL_USE_MSR_BITMAPS |
         CPU_BASED_VM_EXEC_CTRL_USE_IO_BITMAPS |
         CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS,
@@ -239,31 +267,26 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING),
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_USE_TSC_OFFSETTING));
 
+    __cpuidex(cpu_info, 7, 0);
     sec_proc = vmx_adjust_controls(
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_VPID |
         CPU_BASED_VM_EXEC_CTRL2_RDTSCP |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_INVPCID |
         CPU_BASED_VM_EXEC_CTRL2_ENABLE_XSAVES |
-        CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE, //  does not gurantee latest versions of windows 11 support yet btw
+        (((UINT32)cpu_info[2] & (1U << 5))
+            ? CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE : 0),
         IA32_VMX_PROCBASED_CTLS2);
+    if (!(sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT))
+        return FALSE;
 
+    vcpu->waitpkg_enabled =
+        ((sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE) != 0);
     __vmx_vmwrite(VMCS_CTRL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, sec_proc);
 
-    UINT32 pin_ctrl = vmx_adjust_controls(
-        PIN_BASED_VM_EXEC_CTRL_NMI_EXITING |
-        PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI,
+    pin_ctrl = vmx_adjust_controls(
+        PIN_BASED_VM_EXEC_CTRL_NMI_EXITING,
         vmx_basic.VmxControls ? IA32_VMX_TRUE_PINBASED_CTLS : IA32_VMX_PINBASED_CTLS);
-
-    //
-    // SDM: "virtual NMIs" requires "NMI exiting" — some nested VMX
-    // implementations (Hyper-V) don't advertise NMI exiting in the
-    // capability MSR's allowed-1 set despite supporting it.
-    // Force the constraint; if truly unsupported, VMLAUNCH will fail
-    // with a clear error rather than the cryptic VirtNMI-without-NMI.
-    //
-    if (pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI)
-        pin_ctrl |= PIN_BASED_VM_EXEC_CTRL_NMI_EXITING;
 
     __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin_ctrl);
 
@@ -285,10 +308,14 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     // VMCS_VMEXIT_INTERRUPTION_INFORMATION. without this, pending interrupts
     // cause an infinite vm-exit loop -> TDR -> black blink
     //
-    UINT32 exit_ctrl = vmx_adjust_controls(
+    exit_ctrl = vmx_adjust_controls(
         VM_EXIT_CTRL_HOST_ADDRESS_SPACE_SIZE |
         VM_EXIT_CTRL_SAVE_DEBUG_CONTROLS |
-        VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT,
+        VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT |
+        (vcpu->pmu_gp_count
+            ? VM_EXIT_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL |
+              VM_EXIT_CTRL_SAVE_IA32_PERF_GLOBAL_CTRL
+            : 0),
         vmx_basic.VmxControls ? IA32_VMX_TRUE_EXIT_CTLS : IA32_VMX_EXIT_CTLS);
 
     __vmx_vmwrite(VMCS_CTRL_PRIMARY_VMEXIT_CONTROLS, exit_ctrl);
@@ -300,11 +327,22 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     // IA-32e mode guest, load debug controls
     // required so guest sees its own DR7 after VM-exit/entry cycle
     //
-    __vmx_vmwrite(VMCS_CTRL_VMENTRY_CONTROLS,
-                  vmx_adjust_controls(
-                      VM_ENTRY_CTRL_IA32E_MODE_GUEST |
-                      VM_ENTRY_CTRL_LOAD_DEBUG_CONTROLS,
-                      vmx_basic.VmxControls ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS));
+    entry_ctrl = vmx_adjust_controls(
+        VM_ENTRY_CTRL_IA32E_MODE_GUEST |
+        VM_ENTRY_CTRL_LOAD_DEBUG_CONTROLS |
+        (vcpu->pmu_gp_count ? VM_ENTRY_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL : 0),
+        vmx_basic.VmxControls ? IA32_VMX_TRUE_ENTRY_CTLS : IA32_VMX_ENTRY_CTLS);
+    __vmx_vmwrite(VMCS_CTRL_VMENTRY_CONTROLS, entry_ctrl);
+
+    vcpu->pmu_isolated =
+        vcpu->pmu_gp_count &&
+        (exit_ctrl & VM_EXIT_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL) &&
+        (entry_ctrl & VM_ENTRY_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL);
+    if (vcpu->pmu_isolated)
+    {
+        __vmx_vmwrite(VMCS_GUEST_PERF_GLOBAL_CTRL, vcpu->perf_global_ctrl);
+        __vmx_vmwrite(VMCS_HOST_PERF_GLOBAL_CTRL, 0);
+    }
 
     //
     // CR0: 0 = don't cause VM-exit on CR0 modifications (pass-through)
@@ -356,7 +394,7 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 #if USE_PRIVATE_HOST_CR3
     __vmx_vmwrite(VMCS_HOST_CR3, hostcr3_get());
 #else
-    __vmx_vmwrite(VMCS_HOST_CR3, get_system_cr3());
+    __vmx_vmwrite(VMCS_HOST_CR3, g_system_cr3 ? g_system_cr3 : __readcr3());
 #endif
 
     __vmx_vmwrite(VMCS_GUEST_GDTR_BASE,  asm_get_gdt_base());
@@ -456,25 +494,25 @@ vmx_virtualize_cpu(PVOID guest_stack)
         DbgPrintEx(0, 0, "[hv] VMXON failed on core %u\n", core);
         return FALSE;
     }
+    vcpu->vmxon_active = TRUE;
 
-    if (!vmx_clear_vmcs(vcpu))
+    if (!vmx_clear_vmcs(vcpu) ||
+        !vmx_load_vmcs(vcpu) ||
+        !vmx_setup_vmcs(vcpu, guest_stack))
+    {
+        DbgPrintEx(0, 0, "[hv] VMCS setup failed on core %u\n", core);
+        __vmx_off();
+        vcpu->vmxon_active = FALSE;
         return FALSE;
-
-    if (!vmx_load_vmcs(vcpu))
-        return FALSE;
-
-    vmx_setup_vmcs(vcpu, guest_stack);
+    }
 
     vcpu->launched = TRUE;
-
     __vmx_vmlaunch();
 
-    //
-    // if we reach here, VMLAUNCH failed
-    //
     vcpu->launched = FALSE;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
+    vcpu->vmxon_active = FALSE;
 
     DbgPrintEx(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
     return FALSE;
@@ -491,8 +529,10 @@ vmx_vmresume(VOID)
     UINT64 error_code = 0;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
-
     DbgPrintEx(0, 0, "[hv] VMRESUME failed! Error: 0x%llx\n", error_code);
+    __debugbreak();
+    for (;;)
+        __halt();
 }
 
 BOOLEAN
@@ -522,6 +562,13 @@ vmx_init(VOID)
 #if STEALTH_CPUID_CACHING
     stealth_init_cpuid_cache();
 #endif
+
+    {
+        KAPC_STATE apc_state;
+        KeStackAttachProcess(PsInitialSystemProcess, &apc_state);
+        g_system_cr3 = __readcr3();
+        KeUnstackDetachProcess(&apc_state);
+    }
 
     if (!ept_init())
     {
@@ -567,6 +614,28 @@ vmx_init(VOID)
             ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
         }
 
+#if STEALTH_VIRTUALIZE_PMU
+        {
+            const UINT32 read_write_msrs[] = {
+                IA32_MPERF, IA32_APERF, IA32_PERF_GLOBAL_CTRL
+            };
+            for (UINT32 bitmap_idx = 0;
+                 bitmap_idx < RTL_NUMBER_OF(read_write_msrs);
+                 bitmap_idx++)
+            {
+                UINT32 msr_idx = read_write_msrs[bitmap_idx];
+                ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |=
+                    (UCHAR)(1 << (msr_idx % 8));
+                ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |=
+                    (UCHAR)(1 << (msr_idx % 8));
+            }
+        }
+#endif
+#if STEALTH_VIRTUALIZE_TIMERS
+        ((PUCHAR)vcpu->msr_bitmap_va)[IA32_X2APIC_CUR_COUNT / 8] |=
+            (UCHAR)(1 << (IA32_X2APIC_CUR_COUNT % 8));
+#endif
+
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
 
@@ -605,6 +674,12 @@ vmx_init(VOID)
             return FALSE;
     }
 
+    if (!ept_setup_timer_hooks())
+    {
+        DbgPrintEx(0, 0, "[hv] Timer virtualization setup failed!\n");
+        return FALSE;
+    }
+
     //
     // build private host page tables AFTER all allocations are done.
     // The snapshot must include PTEs for VMM stacks, bitmaps, and all
@@ -637,7 +712,8 @@ vmx_init(VOID)
     {
         if (!g_vcpu[i].launched)
         {
-            DbgPrintEx(0, 0, "[hv] Core %u failed to launch!\n", i);
+            DbgPrintEx(0, 0, "[hv] Core %u failed to launch; rolling back launched cores.\n", i);
+            broadcast_terminate_all();
             return FALSE;
         }
     }
@@ -651,6 +727,8 @@ vmx_terminate(VOID)
 {
     if (!g_vcpu)
         return;
+
+    ept_destroy_timer_hooks();
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {

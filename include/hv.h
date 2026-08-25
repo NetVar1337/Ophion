@@ -6,7 +6,7 @@
 //
 // windows kernel headers (used only at PASSIVE/DPC level in non-root)
 //
-#include <ntddk.h>
+#include <ntifs.h>
 #include <intrin.h>
 
 #include "ia32.h"
@@ -72,7 +72,11 @@ BOOLEAN ept_setup_pml2(PVMM_EPT_PAGE_TABLE page_table, PEPT_PML2_ENTRY new_entry
 
 PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
-BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
+BOOLEAN ept_split_large_page(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T phys_addr);
+BOOLEAN ept_setup_timer_hooks(VOID);
+VOID    ept_destroy_timer_hooks(VOID);
+BOOLEAN ept_handle_mmio_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys);
+VOID    ept_handle_monitor_trap(VIRTUAL_MACHINE_STATE * vcpu);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 VOID ept_invept_all(VOID);
