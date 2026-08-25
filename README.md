@@ -147,6 +147,18 @@ pwsh -NoProfile -File .\tests\contracts.ps1
 GitHub-hosted Windows CI runs the contract assertions and builds the user-mode probe. It does not compile the driver because the hosted image does not guarantee WDK kernel headers and libraries.
 
 ***
+
+## Boot-time mode
+
+[`boot/OphionBootPkg`](boot/README.md) is the EDK2 boot-time build: a resident DXE driver starts the VMX layer before the Windows loader and establishes a coherent `Microsoft Hv` persona from the first Windows instruction. This is the only architecture that removes the post-boot hypervisor-transition discontinuity; it is compile-verified as a `RELEASE` EFI driver and must first be exercised with OVMF, not a production ESP or firmware flash.
+
+```powershell
+pwsh -NoProfile -File .\boot\build.ps1 `
+  -Edk2Root $env:OPHION_EDK2 `
+  -NasmPrefix $env:NASM_PREFIX `
+  -IaslPrefix $env:IASL_PREFIX `
+  -Target RELEASE
+```
 ## Loading
 
 Loading is intentionally not automated. An administrator can register a driver produced or signed for the target machine:
@@ -217,6 +229,7 @@ Evidence status as of **2026-08-25**:
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
 | Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 145 assertions. |
 | Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
+| `OphionBoot.efi` boot-time DXE driver | Yes | No | EDK2/VS2022 `RELEASE` build passed; SHA-256 `c1dba45c5ab98e215be1f62c2844ffa9824a388b5ff81351c81edefb8b3bb281`. OVMF/hardware boot is pending. |
 | VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
 | Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
 | EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |
