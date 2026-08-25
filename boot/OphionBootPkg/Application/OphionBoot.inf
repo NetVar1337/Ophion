@@ -53,7 +53,7 @@
   TRUE
 
 [Pcd]
-  gOphionBootPkgTokenSpaceGuid.OphionBootMaxProcessors
+  gOphionBootPkgTokenSpaceGuid.OphionBootMaxProcessors ## CONSUMES
 
 [BuildOptions]
   MSFT:*_*_X64_CC_FLAGS = /FAcs /Zi /wd4201

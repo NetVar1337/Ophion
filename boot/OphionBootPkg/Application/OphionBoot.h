@@ -21,6 +21,29 @@
 #define OPB_VMM_STACK_SIZE  0x8000
 #define OPB_POOL_ALIGNMENT  0x1000
 
+#ifndef OPB_ENABLE_RUNTIME_CONCEALMENT
+#define OPB_ENABLE_RUNTIME_CONCEALMENT 0
+#endif
+
+#define OPB_MAX_RUNTIME_ALLOCS  256
+
+typedef enum {
+    OpbAllocVmxon,
+    OpbAllocVmcs,
+    OpbAllocMsrBitmap,
+    OpbAllocHostStack,
+    OpbAllocEptTable,
+    OpbAllocHostCr3,
+    OpbAllocDummyPage
+} OPB_ALLOC_KIND;
+
+typedef struct {
+    EFI_PHYSICAL_ADDRESS Base;
+    UINTN                Pages;
+    OPB_ALLOC_KIND        Kind;
+    BOOLEAN              Conceal;
+} OPB_RUNTIME_ALLOCATION;
+
 typedef struct {
     UINT64 rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi;
     UINT64 r8, r9, r10, r11, r12, r13, r14, r15;
@@ -43,6 +66,8 @@ typedef struct {
     /* persona floor state */
     UINT64 hv_guest_os_id;        /* MSR 0x40000000 shadow */
     UINT64 hv_hypercall_gpa;      /* GPA written to MSR 0x40000001 */
+    UINT64 exit_count;
+
 
     OPB_GUEST_REGS regs;
 } OPB_VCPU;
@@ -55,6 +80,25 @@ typedef struct {
 #pragma pack(pop)
 extern OPB_VCPU g_opb_vcpu[OPB_MAX_PROCESSORS];
 extern UINT32 g_opb_cpu_count;
+extern OPB_RUNTIME_ALLOCATION g_opb_runtime_allocs[OPB_MAX_RUNTIME_ALLOCS];
+extern UINTN g_opb_runtime_alloc_count;
+extern EFI_PHYSICAL_ADDRESS g_opb_host_cr3;
+extern EFI_PHYSICAL_ADDRESS g_opb_dummy_page;
+
+EFI_STATUS
+OpbAllocateRuntimePages (
+    OPB_ALLOC_KIND Kind,
+    UINTN Pages,
+    UINT64 MaxAddress,
+    BOOLEAN Conceal,
+    VOID **Address
+    );
+
+EFI_STATUS
+OpbBuildHostIdentityCr3 (VOID);
+
+EFI_STATUS
+OpbConcealRuntimeAllocations (VOID);
 
 /* Assembly.nasm */
 extern EFI_STATUS

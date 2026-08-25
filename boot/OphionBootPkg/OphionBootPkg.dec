@@ -20,3 +20,8 @@
 [PcdsFixedAtBuild]
   ## Maximum logical processors supported by the boot hypervisor.
   gOphionBootPkgTokenSpaceGuid.OphionBootMaxProcessors|64|UINT32|0x00000001
+
+
+  ## Lab-only: redirect registered VMM runtime pages to a dummy guest page
+  ## after the first 128 VM exits. Disabled until OVMF validation is green.
+  gOphionBootPkgTokenSpaceGuid.OphionBootConcealRuntime|FALSE|BOOLEAN|0x00000002

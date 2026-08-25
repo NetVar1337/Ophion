@@ -229,7 +229,7 @@ Evidence status as of **2026-08-25**:
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
 | Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 145 assertions. |
 | Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
-| `OphionBoot.efi` boot-time DXE driver | Yes | No | EDK2/VS2022 `RELEASE` build passed; SHA-256 `c1dba45c5ab98e215be1f62c2844ffa9824a388b5ff81351c81edefb8b3bb281`. OVMF/hardware boot is pending. |
+| `OphionBoot.efi` boot-time DXE driver | Yes | No | EDK2/VS2022 `RELEASE` build passed; SHA-256 `79b9d6fc8a9370a79153d3cc1a4a4b305c970f02bf19c038b387a14226f5d3ed`. OVMF/hardware boot is pending. |
 | VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
 | Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
 | EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |

@@ -25,8 +25,23 @@ Expected output:
 The validated Release artifact built on this workstation hashed to:
 
 ```text
-c1dba45c5ab98e215be1f62c2844ffa9824a388b5ff81351c81edefb8b3bb281
+79b9d6fc8a9370a79153d3cc1a4a4b305c970f02bf19c038b387a14226f5d3ed
 ```
+
+## Hyper-V attachment preflight
+
+The clean-room attachment path is designed to use a genuine Microsoft Hyper-V
+host rather than fabricate its full runtime. Run the read-only preflight
+before any OVMF attachment experiment:
+
+```powershell
+pwsh -NoProfile -File .\tools\build-probe.ps1 -Configuration Release -WarningsAsErrors
+pwsh -NoProfile -File .\tools\hyperv-attachment-preflight.ps1
+```
+
+`readyForAttachmentLab` is true only when both Windows and CPUID report a
+real `Microsoft Hv` stratum. The attachment design and license boundary are
+in [`HyperVAttachment.md`](HyperVAttachment.md).
 
 ## Lab boot path
 
@@ -37,6 +52,6 @@ c1dba45c5ab98e215be1f62c2844ffa9824a388b5ff81351c81edefb8b3bb281
 
 ## Current boundary
 
-This is a compiled boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It intentionally provides only the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for flush/post-message style hypercalls. Expand it only from trace evidence captured during the OVMF boot path.
+This is a compiled boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It intentionally provides only the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for flush/post-message style hypercalls. The allocation registry and dummy-page redirector are compile-present but disabled; the redirector is intentionally single-core until the attachment mode provides all-vCPU stop/ack and INVEPT synchronization. Expand it only from trace evidence captured during the OVMF boot path.
 
 Do not modify `bootmgfw.efi`, SPI flash, measured-boot state, TPM state, or a production ESP until the OVMF boot matrix is green.

@@ -90,6 +90,24 @@ OpbVmExitHandler (
 
     Reason = VmRead64 (VMCS_EXIT_REASON) & 0xFFFF;
 
+    Vcpu->exit_count++;
+
+    /*
+     * Lab-only page concealment is disabled unless the build defines
+     * OPB_ENABLE_RUNTIME_CONCEALMENT=1. Multi-core TLB synchronization is
+     * part of the OVMF gate; release defaults leave all guest mappings live.
+     */
+#if OPB_ENABLE_RUNTIME_CONCEALMENT
+    if (g_opb_cpu_count == 1 &&
+        Vcpu->core_index == 0 && Vcpu->exit_count == 128) {
+        Status = OpbConcealRuntimeAllocations ();
+        if (EFI_ERROR (Status)) {
+            Vcpu->terminal = TRUE;
+            CpuDeadLoop ();
+        }
+    }
+#endif
+
     switch (Reason) {
     case EXIT_CPUID:
         Leaf = (UINT32)Regs->rax;

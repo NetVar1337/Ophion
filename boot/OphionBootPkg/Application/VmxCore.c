@@ -8,6 +8,7 @@
  */
 
 #include "OphionBoot.h"
+#include <Library/PcdLib.h>
 
 /* VMCS field encodings (Intel SDM Appendix B) */
 #define VMCS_VPID                       0x00000000
@@ -157,26 +158,99 @@ VmWrite64 (
 /* Descriptor/segment helper declarations live in OphionBoot.h. */
 
 #define MAX_PHYS_4GB 0xFFFFFFFFULL
+#define OPB_HOST_CR3_LIMIT (512ULL * 1024 * 1024 * 1024)
+
+OPB_RUNTIME_ALLOCATION g_opb_runtime_allocs[OPB_MAX_RUNTIME_ALLOCS];
+UINTN g_opb_runtime_alloc_count = 0;
+EFI_PHYSICAL_ADDRESS g_opb_host_cr3 = 0;
+EFI_PHYSICAL_ADDRESS g_opb_dummy_page = 0;
+
+EFI_STATUS
+OpbAllocateRuntimePages (
+    OPB_ALLOC_KIND Kind,
+    UINTN Pages,
+    UINT64 MaxAddress,
+    BOOLEAN Conceal,
+    VOID **Address
+    )
+{
+    EFI_PHYSICAL_ADDRESS Base;
+    EFI_STATUS Status;
+
+    if (Address == NULL || Pages == 0 ||
+        g_opb_runtime_alloc_count >= OPB_MAX_RUNTIME_ALLOCS) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    Base = MaxAddress & ~(UINT64)0xFFF;
+    Status = gBS->AllocatePages (
+                    MaxAddress == MAX_UINT64
+                        ? AllocateAnyPages
+                        : AllocateMaxAddress,
+                    EfiRuntimeServicesData,
+                    Pages,
+                    &Base
+                    );
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+
+    SetMem ((VOID *)(UINTN)Base, EFI_PAGES_TO_SIZE (Pages), 0);
+    g_opb_runtime_allocs[g_opb_runtime_alloc_count].Base = Base;
+    g_opb_runtime_allocs[g_opb_runtime_alloc_count].Pages = Pages;
+    g_opb_runtime_allocs[g_opb_runtime_alloc_count].Kind = Kind;
+    g_opb_runtime_allocs[g_opb_runtime_alloc_count].Conceal = Conceal;
+    g_opb_runtime_alloc_count++;
+    *Address = (VOID *)(UINTN)Base;
+    return EFI_SUCCESS;
+}
 
 STATIC
 VOID *
 OpbAllocatePage (
-    UINT64 MaxAddress
+    OPB_ALLOC_KIND Kind,
+    UINT64 MaxAddress,
+    BOOLEAN Conceal
     )
 {
-    EFI_PHYSICAL_ADDRESS Page = MaxAddress & ~(UINT64)0xFFF;
-    EFI_STATUS Status;
+    VOID *Page = NULL;
 
-    Status = gBS->AllocatePages (AllocateMaxAddress, EfiRuntimeServicesData,
-                                 1, &Page);
-    if (EFI_ERROR (Status)) {
-        Status = gBS->AllocatePages (AllocateAnyPages, EfiRuntimeServicesData,
-                                     1, &Page);
-    }
-    if (EFI_ERROR (Status)) {
+    if (EFI_ERROR (OpbAllocateRuntimePages (
+                        Kind, 1, MaxAddress, Conceal, &Page))) {
         return NULL;
     }
-    return (VOID *)(UINTN)Page;
+    return Page;
+}
+
+EFI_STATUS
+OpbBuildHostIdentityCr3 (VOID)
+{
+    UINT64 *Pml4;
+    UINT64 *Pdpt;
+    UINTN Index;
+    EFI_STATUS Status;
+
+    if (g_opb_host_cr3 != 0) {
+        return EFI_SUCCESS;
+    }
+
+    Status = OpbAllocateRuntimePages (
+                 OpbAllocHostCr3, 1, MAX_PHYS_4GB, TRUE, (VOID **)&Pml4);
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+    Status = OpbAllocateRuntimePages (
+                 OpbAllocHostCr3, 1, MAX_PHYS_4GB, TRUE, (VOID **)&Pdpt);
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+
+    Pml4[0] = ((UINT64)(UINTN)Pdpt & 0x000FFFFFFFFFF000ULL) | 0x3;
+    for (Index = 0; Index < 512; Index++) {
+        Pdpt[Index] = ((UINT64)Index << 30) | 0x83; /* 1GB RW identity */
+    }
+    g_opb_host_cr3 = (EFI_PHYSICAL_ADDRESS)(UINTN)Pml4;
+    return EFI_SUCCESS;
 }
 
 /* segment access rights expansion for a raw selector in the current GDT */
@@ -271,6 +345,8 @@ typedef struct {
 } OPB_EPT_STATE;
 
 STATIC OPB_EPT_STATE m_Ept;
+STATIC UINT64 m_EptPointer = 0;
+STATIC BOOLEAN m_RuntimeConcealed = FALSE;
 
 STATIC
 OPB_EPT_ENTRY *
@@ -278,7 +354,7 @@ OpbEptAllocateTable (
     VOID
     )
 {
-    VOID *Table = OpbAllocatePage (MAX_PHYS_4GB);
+    VOID *Table = OpbAllocatePage (OpbAllocEptTable, MAX_PHYS_4GB, TRUE);
     if (Table != NULL) {
         SetMem (Table, 0x1000, 0);
     }
@@ -421,6 +497,105 @@ OpbEptIdentityMap (
     return Status;
 }
 
+EFI_STATUS
+OpbEptSplit2Mb (
+    UINT64 GuestPhysical,
+    OPB_EPT_ENTRY **Leaf
+    )
+{
+    UINTN Pml4Index = (GuestPhysical >> 39) & 0x1FF;
+    UINTN PdptIndex = (GuestPhysical >> 30) & 0x1FF;
+    UINTN PdIndex = (GuestPhysical >> 21) & 0x1FF;
+    UINTN PtIndex = (GuestPhysical >> 12) & 0x1FF;
+    OPB_EPT_ENTRY *Pde;
+    OPB_EPT_ENTRY *Pt;
+    UINT64 Original;
+    UINT64 Base;
+    UINTN Index;
+
+    if (Pml4Index >= 512 || m_Ept.Pd[Pml4Index][PdptIndex] == NULL) {
+        return EFI_NOT_FOUND;
+    }
+
+    Pde = &m_Ept.Pd[Pml4Index][PdptIndex][PdIndex];
+    if (Pde->LargePage) {
+        Pt = OpbEptAllocateTable ();
+        if (Pt == NULL) {
+            return EFI_OUT_OF_RESOURCES;
+        }
+        Original = Pde->Uint64;
+        Base = Original & 0x000FFFFFFFE00000ULL;
+        for (Index = 0; Index < 512; Index++) {
+            Pt[Index].Uint64 = (Original & ~((UINT64)BIT7 |
+                                0x000FFFFFFFFFF000ULL)) |
+                               (Base + ((UINT64)Index << 12));
+        }
+        Pde->Uint64 = 0;
+        Pde->Read = 1;
+        Pde->Write = 1;
+        Pde->Execute = 1;
+        Pde->PageFrame = (UINT64)(UINTN)Pt >> 12;
+    }
+
+    Pt = (OPB_EPT_ENTRY *)(UINTN)(Pde->PageFrame << 12);
+    *Leaf = &Pt[PtIndex];
+    return EFI_SUCCESS;
+}
+
+EFI_STATUS
+OpbConcealRuntimeAllocations (VOID)
+{
+    EFI_STATUS Status;
+    VOID *Dummy = NULL;
+    UINTN AllocationIndex;
+
+    /*
+     * INVEPT is per logical processor. Keep the lab feature single-core
+     * until the attachment path supplies an all-core stop/ack epoch and
+     * invalidates every active EPT context.
+     */
+    if (g_opb_cpu_count != 1) {
+        return EFI_UNSUPPORTED;
+    }
+    if (m_RuntimeConcealed) {
+        return EFI_SUCCESS;
+    }
+    Status = OpbAllocateRuntimePages (
+                 OpbAllocDummyPage, 1, MAX_PHYS_4GB, FALSE, &Dummy);
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
+    SetMem (Dummy, 0x1000, 0xFF);
+    g_opb_dummy_page = (EFI_PHYSICAL_ADDRESS)(UINTN)Dummy;
+
+    for (AllocationIndex = 0;
+         AllocationIndex < g_opb_runtime_alloc_count;
+         AllocationIndex++) {
+        OPB_RUNTIME_ALLOCATION *Allocation =
+            &g_opb_runtime_allocs[AllocationIndex];
+        UINTN Page;
+
+        if (!Allocation->Conceal || Allocation->Kind == OpbAllocDummyPage) {
+            continue;
+        }
+        for (Page = 0; Page < Allocation->Pages; Page++) {
+            OPB_EPT_ENTRY *Leaf;
+            Status = OpbEptSplit2Mb (
+                         Allocation->Base + EFI_PAGES_TO_SIZE (Page), &Leaf);
+            if (EFI_ERROR (Status)) {
+                return Status;
+            }
+            Leaf->PageFrame = g_opb_dummy_page >> 12;
+            Leaf->Read = 1;
+            Leaf->Write = 1;
+            Leaf->Execute = 1;
+            Leaf->Type = 6;
+        }
+    }
+    m_RuntimeConcealed = TRUE;
+    return AsmInveptSingleContext (m_EptPointer);
+}
+
 /* update CR0/CR4 to satisfy VMX fixed bits and enable VMXE */
 STATIC
 EFI_STATUS
@@ -507,12 +682,18 @@ OpbSetupCurrentCore (
         return Status;
     }
 
-    VmxonRegion = OpbAllocatePage (MAX_PHYS_4GB);
-    VmcsRegion = OpbAllocatePage (MAX_PHYS_4GB);
-    MsrBitmap = OpbAllocatePage (MAX_PHYS_4GB);
-    HostStack = AllocatePool (OPB_VMM_STACK_SIZE);
+    VmxonRegion = OpbAllocatePage (OpbAllocVmxon, MAX_PHYS_4GB, TRUE);
+    VmcsRegion = OpbAllocatePage (OpbAllocVmcs, MAX_PHYS_4GB, TRUE);
+    MsrBitmap = OpbAllocatePage (OpbAllocMsrBitmap, MAX_PHYS_4GB, TRUE);
+    Status = OpbAllocateRuntimePages (
+                 OpbAllocHostStack,
+                 EFI_SIZE_TO_PAGES (OPB_VMM_STACK_SIZE),
+                 MAX_PHYS_4GB,
+                 TRUE,
+                 &HostStack
+                 );
     if (VmxonRegion == NULL || VmcsRegion == NULL || MsrBitmap == NULL ||
-        HostStack == NULL) {
+        EFI_ERROR (Status) || HostStack == NULL) {
         return EFI_OUT_OF_RESOURCES;
     }
     SetMem (VmxonRegion, 0x1000, 0);
@@ -546,6 +727,10 @@ OpbSetupCurrentCore (
             return Status;
         }
     }
+    Status = OpbBuildHostIdentityCr3 ();
+    if (EFI_ERROR (Status)) {
+        return Status;
+    }
 
     /* EPTP: WB memory type (bits 2:0), 4-level walk (bits 5:3=3),
      * page-table PFN at bit 12. */
@@ -564,6 +749,7 @@ OpbSetupCurrentCore (
         return Status;
     }
     Status = OpbVmptrld (&Vcpu->vmcs_pa);
+    m_EptPointer = EptPointer;
     if (EFI_ERROR (Status)) {
         return Status;
     }
@@ -636,8 +822,7 @@ OpbSetupCurrentCore (
     VmWrite64 (VMCS_CR4_READ_SHADOW, AsmReadCr4 () & ~0x2000ULL);
 
     VmWrite64 (VMCS_HOST_CR0, AsmReadCr0 ());
-    VmWrite64 (VMCS_HOST_CR3, AsmReadCr3 ());
-    VmWrite64 (VMCS_HOST_CR4, AsmReadCr4 () | 0x2000);
+    VmWrite64 (VMCS_HOST_CR3, g_opb_host_cr3);
     VmWrite64 (VMCS_HOST_FS_BASE, AsmReadMsr64 (IA32_FS_BASE_MSR));
     VmWrite64 (VMCS_HOST_GS_BASE, AsmReadMsr64 (IA32_GS_BASE_MSR));
     VmWrite64 (VMCS_HOST_SYSENTER_CS, AsmReadMsr64 (IA32_SYSENTER_CS_MSR));
