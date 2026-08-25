@@ -5,6 +5,7 @@ param(
     [switch]$Clean,
     [switch]$CleanOnly,
     [switch]$WarningsAsErrors,
+    [switch]$Production,
     [switch]$CodeAnalysis,
     [string]$WdkVersion,
     [string]$CertificateThumbprint,
@@ -107,6 +108,7 @@ $repo = $PSScriptRoot
 $objDir = Join-Path $repo "build\obj\$Configuration"
 $binDir = Join-Path $repo "build\bin\$Configuration"
 $output = Join-Path $binDir 'Ophion.sys'
+if ($Production) { $output = Join-Path $binDir 'Ophion-production.sys' }
 
 if ($Clean -or $CleanOnly) {
     Remove-Item -LiteralPath $objDir, $binDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -143,6 +145,7 @@ if ($Configuration -eq 'Release') {
     $compile += @('/Od', '/Ob0', '/D_DEBUG', '/DDBG=1')
 }
 if ($WarningsAsErrors) { $compile += '/WX' }
+if ($Production) { $compile += '/DOPHION_PRODUCTION=1' }
 if ($CodeAnalysis) { $compile += '/analyze' }
 
 $objects = [System.Collections.Generic.List[string]]::new()
@@ -166,12 +169,18 @@ $libraries = foreach ($name in $libraryNames) {
     if (-not (Test-Path $path)) { throw "Required WDK library not found: $path" }
     $path
 }
+$pdbPath = [System.IO.Path]::ChangeExtension($output, '.pdb')
 $linkArgs = @(
     '/NOLOGO', "/OUT:$output", '/MACHINE:X64', '/SUBSYSTEM:NATIVE', '/DRIVER',
     '/KERNEL', '/ENTRY:DriverEntry', '/NODEFAULTLIB', '/INCREMENTAL:NO',
     '/MANIFEST:NO', '/DYNAMICBASE', '/NXCOMPAT', '/DEBUG',
-    "/PDB:$(Join-Path $binDir 'Ophion.pdb')"
+    "/PDB:$pdbPath"
 )
+if ($Production) {
+    # keep symbols locally but never embed the build machine's path or the
+    # project name in the shipped binary
+    $linkArgs += '/PDBALTPATH:driver.pdb'
+}
 if ($Configuration -eq 'Release') {
     $linkArgs += @('/OPT:REF', '/OPT:ICF')
 } else {

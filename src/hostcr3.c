@@ -174,7 +174,7 @@ hostcr3_build(VOID)
     PUINT64 orig_pml4 = host_map_phys(pml4_pa);
     if (!orig_pml4)
     {
-        DbgPrintEx(0, 0, "[hv] hostcr3: failed to map PML4 at PA 0x%llx\n", pml4_pa);
+        HV_LOG(0, 0, "[hv] hostcr3: failed to map PML4 at PA 0x%llx\n", pml4_pa);
         return FALSE;
     }
 
@@ -241,7 +241,7 @@ hostcr3_build(VOID)
         }
     }
 
-    DbgPrintEx(0, 0, "[hv] Private host CR3 built: PA=0x%llx (%u pages allocated)\n",
+    HV_LOG(0, 0, "[hv] Private host CR3 built: PA=0x%llx (%u pages allocated)\n",
                g_host_pml4_pa, g_host_pt_count);
 
     return TRUE;

@@ -203,4 +203,23 @@ Assert ($ept -match 'ept_mul_div_u64' -and $ept -match 'if\s*\(!divisor\s*\|\|\s
 Assert ($vmexit -match '(?s)vmexit_enter_terminal\s*\([^)]*\)\s*\{.*?vcpu->advance_rip\s*=\s*FALSE;') 'terminal helper must suppress RIP advancement'
 Assert ($vmexit -match '(?s)default:\s*vmexit_enter_terminal\s*\(\s*vcpu\s*,\s*HV_FAILURE_UNKNOWN_EXIT\s*\);\s*break;') 'unknown VM exits must enter the terminal path'
 
+# Production stealth profile: logging, status device, and identifiable pool
+# tags must compile out; VM-exit state sampling must be reason-conditional.
+$hvHeader = Get-Content -LiteralPath (Join-Path $repo 'include\hv.h') -Raw
+$hvTypes = Get-Content -LiteralPath (Join-Path $repo 'include\hv_types.h') -Raw
+Assert ($hvHeader -match '(?s)#if\s+OPHION_PRODUCTION\s*#define\s+HV_LOG\(\.\.\.\)\s+\(\(void\)0\)') 'production logging must compile to nothing'
+$buildScript = Get-Content -LiteralPath (Join-Path $repo 'build.ps1') -Raw
+$driverSource = Get-Content -LiteralPath (Join-Path $repo 'src\driver.c') -Raw
+Assert ($hvHeader -match '#ifndef\s+OPHION_PRODUCTION' -and $hvHeader -match '#define\s+HV_LOG') 'production profile macro must exist'
+Assert ($hvTypes -match "(?s)#if\s+OPHION_PRODUCTION.*#define\s+HV_POOL_TAG\s+'DptS'.*#else.*#define\s+HV_POOL_TAG\s+'nhpO'") 'pool tag profile split drifted'
+Assert ('DptS' -notmatch 'Ophn' -and 'DptS' -notmatch 'Ophi') 'production pool tag must not identify the project'
+Assert ($vmexit -match 'vmexit_exit_sample_plan' -and $vmexit -match 'VMEXIT_SAMPLE_DR' -and $vmexit -match 'VMEXIT_SAMPLE_APERF_MPERF') 'conditional exit sampling plan drifted'
+Assert ($vmexit -match 'sample_plan\s*&\s*VMEXIT_SAMPLE_DR\)\)' -and $vmexit -match 'sample_plan\s*&\s*VMEXIT_SAMPLE_CR8\)\)') 'exit epilogue must restore only sampled state'
+Assert ($vmexit -match 'VMCS_GUEST_DR7,\s*&dr7_raw' -and $vmexit -match 'RFLAGS_TF' ) 'DR sampling must stay live for TF/DR7 debugging probes'
+$productionEntry = [regex]::Match($driverSource, '(?s)#else\s*//\s*OPHION_PRODUCTION\s*(?<body>.*?)#endif\s*//\s*OPHION_PRODUCTION').Groups['body'].Value
+Assert ($productionEntry -match 'vmx_init\(\)' -and $productionEntry -notmatch 'IoCreateDevice' -and $productionEntry -notmatch 'IoCreateSymbolicLink') 'production entry must create no device objects'
+Assert ($driverSource -match '(?s)#if\s+!OPHION_PRODUCTION\s*.*IoCreateDevice') 'default entry must keep the status device'
+Assert ($buildScript -match '\[switch\]\$Production' -and $buildScript -match '/DOPHION_PRODUCTION=1') 'build pipeline must expose the production switch'
+Assert ($vmexit -match 'vmexit_advance_rip\s*\(\s*vcpu\s*\)' -and ($vmexit | Select-String -Pattern 'vmexit_advance_rip' -AllMatches).Matches.Count -ge 2) 'exit epilogue must call the RIP advance path'
+
 Write-Host "Contract assertions passed: $script:assertions"

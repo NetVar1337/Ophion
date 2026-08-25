@@ -1105,11 +1105,53 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
     }
 }
 
+//
+// per-exit state sampling plan: only the state a given exit reason actually
+// consumes is read from hardware. unconditional DR/CR8/PMU/LAPIC reads on
+// every exit inflated VM-exit cost, which instruction-execution-timing probes
+// (CPUID vs non-exiting instruction) measure directly.
+//
+#define VMEXIT_SAMPLE_APERF_MPERF   0x1u
+#define VMEXIT_SAMPLE_LAPIC         0x2u
+#define VMEXIT_SAMPLE_DR            0x4u
+#define VMEXIT_SAMPLE_CR8           0x8u
+
+static __forceinline UINT32
+vmexit_exit_sample_plan(UINT32 exit_reason)
+{
+    switch (exit_reason)
+    {
+    case VMX_EXIT_REASON_EXECUTE_RDMSR:
+    case VMX_EXIT_REASON_EXECUTE_WRMSR:
+        return VMEXIT_SAMPLE_APERF_MPERF | VMEXIT_SAMPLE_LAPIC;
+
+    case VMX_EXIT_REASON_EXECUTE_CPUID:
+    case VMX_EXIT_REASON_EXECUTE_RDTSC:
+    case VMX_EXIT_REASON_EXECUTE_RDTSCP:
+    case VMX_EXIT_REASON_EXECUTE_RDPMC:
+    case VMX_EXIT_REASON_EPT_VIOLATION:
+    case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
+        return VMEXIT_SAMPLE_APERF_MPERF | VMEXIT_SAMPLE_LAPIC;
+
+    case VMX_EXIT_REASON_MOV_DR:
+        return VMEXIT_SAMPLE_DR;
+
+    case VMX_EXIT_REASON_EXTERNAL_INTERRUPT:
+    case VMX_EXIT_REASON_INTERRUPT_WINDOW:
+    case VMX_EXIT_REASON_MOV_CR:
+        return VMEXIT_SAMPLE_CR8;
+
+    default:
+        return 0;
+    }
+}
+
 BOOLEAN
 vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 {
     size_t  exit_raw = 0;
     UINT32  exit_reason    = 0;
+    UINT32  sample_plan    = 0;
     BOOLEAN result        = FALSE;
 
 #if STEALTH_COMPENSATE_TIMING
@@ -1125,23 +1167,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->advance_rip = TRUE;
 
     vcpu->root_tsc_entry = __rdtsc();
-    if (vcpu->aperf_mperf_supported)
-    {
-        vcpu->aperf_root_entry = __readmsr(IA32_APERF);
-        vcpu->mperf_root_entry = __readmsr(IA32_MPERF);
-    }
-    if (vcpu->x2apic_enabled)
-        vcpu->lapic_root_entry = (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
-    else if (vcpu->lapic_va)
-        vcpu->lapic_root_entry =
-            *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va + XAPIC_CURRENT_COUNT_OFFSET);
-
-    vcpu->guest_dr0 = __readdr(0);
-    vcpu->guest_dr1 = __readdr(1);
-    vcpu->guest_dr2 = __readdr(2);
-    vcpu->guest_dr3 = __readdr(3);
-    vcpu->guest_dr6 = __readdr(6);
-    vcpu->guest_cr8 = (UINT8)__readcr8();
 
     // __vmx_vmread writes size_t
     if (!vmx_vmread_checked(vcpu, VMCS_EXIT_REASON, &exit_raw))
@@ -1155,6 +1180,50 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     if (exit_reason < HV_STATUS_EXIT_REASON_COUNT)
         vcpu->exit_counters[exit_reason]++;
 
+    //
+    // conditional per-exit sampling (see vmexit_exit_sample_plan). the DR
+    // shadow is additionally sampled whenever guest debugging is live —
+    // advance_rip's pending-debug merge needs an exact DR0-DR3 image when
+    // TF or any DR7 local/global breakpoint enable is set (VMAware-class
+    // TF+DR0 collision probes), but normal execution skips all five reads.
+    //
+    sample_plan = vmexit_exit_sample_plan(exit_reason);
+    if (!(sample_plan & VMEXIT_SAMPLE_DR))
+    {
+        UINT64 dr7_raw = 0;
+        UINT64 rflags_raw = 0;
+        __vmx_vmread(VMCS_GUEST_DR7, &dr7_raw);
+        __vmx_vmread(VMCS_GUEST_RFLAGS, &rflags_raw);
+        if ((dr7_raw & 0xFF) != 0 || (rflags_raw & RFLAGS_TF) != 0)
+            sample_plan |= VMEXIT_SAMPLE_DR;
+    }
+
+    if ((sample_plan & VMEXIT_SAMPLE_APERF_MPERF) &&
+        vcpu->aperf_mperf_supported)
+    {
+        vcpu->aperf_root_entry = __readmsr(IA32_APERF);
+        vcpu->mperf_root_entry = __readmsr(IA32_MPERF);
+    }
+    if (sample_plan & VMEXIT_SAMPLE_LAPIC)
+    {
+        if (vcpu->x2apic_enabled)
+            vcpu->lapic_root_entry =
+                (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
+        else if (vcpu->lapic_va)
+            vcpu->lapic_root_entry =
+                *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va +
+                                     XAPIC_CURRENT_COUNT_OFFSET);
+    }
+    if (sample_plan & VMEXIT_SAMPLE_CR8)
+        vcpu->guest_cr8 = (UINT8)__readcr8();
+    if (sample_plan & VMEXIT_SAMPLE_DR)
+    {
+        vcpu->guest_dr0 = __readdr(0);
+        vcpu->guest_dr1 = __readdr(1);
+        vcpu->guest_dr2 = __readdr(2);
+        vcpu->guest_dr3 = __readdr(3);
+        vcpu->guest_dr6 = __readdr(6);
+    }
     // A different exit can preempt the MTF retry window. Fail closed and
     // let the original MMIO instruction fault/re-arm when it is retried.
     if (vcpu->mtf_hook &&
@@ -1847,21 +1916,21 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         }
     }
 #endif
-
     if (!vcpu->vmxoff.executed && vcpu->advance_rip)
     {
         vmexit_advance_rip(vcpu);
     }
 
-    if (!vcpu->vmxoff.executed)
+    if (!vcpu->vmxoff.executed && (sample_plan & VMEXIT_SAMPLE_DR))
     {
         __writedr(0, vcpu->guest_dr0);
         __writedr(1, vcpu->guest_dr1);
         __writedr(2, vcpu->guest_dr2);
         __writedr(3, vcpu->guest_dr3);
         __writedr(6, vcpu->guest_dr6);
-        __writecr8(vcpu->guest_cr8);
     }
+    if (!vcpu->vmxoff.executed && (sample_plan & VMEXIT_SAMPLE_CR8))
+        __writecr8(vcpu->guest_cr8);
 
     if (vcpu->vmxoff.executed)
         result = TRUE;
@@ -1887,14 +1956,16 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 #else
         UNREFERENCED_PARAMETER(root_delta);
 #endif
-        if (vcpu->aperf_mperf_supported)
+        if ((sample_plan & VMEXIT_SAMPLE_APERF_MPERF) &&
+            vcpu->aperf_mperf_supported)
         {
             vcpu->aperf_root_bias +=
                 __readmsr(IA32_APERF) - vcpu->aperf_root_entry;
             vcpu->mperf_root_bias +=
                 __readmsr(IA32_MPERF) - vcpu->mperf_root_entry;
         }
-        if (vcpu->timer_bias_pending)
+        if ((sample_plan & VMEXIT_SAMPLE_LAPIC) &&
+            vcpu->timer_bias_pending)
         {
             if (vcpu->x2apic_enabled)
             {

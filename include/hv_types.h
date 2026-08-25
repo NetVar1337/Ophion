@@ -17,7 +17,13 @@
 #define MAX_PROCESSORS          256
 #define MAX_MTRR_RANGES         256
 
+#if OPHION_PRODUCTION
+// benign production tag: must not identify the project (pool-tag scanners
+// flag rare tags with no owning module). allocated and freed consistently.
+#define HV_POOL_TAG             'DptS'
+#else
 #define HV_POOL_TAG             'nhpO'
+#endif
 
 typedef struct _GUEST_REGS {
     UINT64 rax;

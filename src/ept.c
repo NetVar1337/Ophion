@@ -118,7 +118,7 @@ ept_check_features(VOID)
 
     if (!vpid_reg.PageWalkLength4 || !vpid_reg.MemoryTypeWriteBack || !vpid_reg.Pde2MbPages)
     {
-        DbgPrintEx(0, 0, "[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
+        HV_LOG(0, 0, "[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
                  (int)vpid_reg.PageWalkLength4,
                  (int)vpid_reg.MemoryTypeWriteBack,
                  (int)vpid_reg.Pde2MbPages);
@@ -133,7 +133,7 @@ ept_check_features(VOID)
     g_ept->invvpid_all_contexts           = vpid_reg.InvvpidAllContexts ? TRUE : FALSE;
     g_ept->invvpid_single_retaining_globals = vpid_reg.InvvpidSingleContextRetainingGlobals ? TRUE : FALSE;
 
-    DbgPrintEx(0, 0, "[hv] INVVPID caps: supported=%d individual=%d single=%d all=%d retaining_globals=%d\n",
+    HV_LOG(0, 0, "[hv] INVVPID caps: supported=%d individual=%d single=%d all=%d retaining_globals=%d\n",
              g_ept->invvpid_supported,
              g_ept->invvpid_individual_addr,
              g_ept->invvpid_single_context,
@@ -142,7 +142,7 @@ ept_check_features(VOID)
 
     if (!mtrr_def.MtrrEnable)
     {
-        DbgPrintEx(0, 0, "[hv] EPT: MTRR not enabled\n");
+        HV_LOG(0, 0, "[hv] EPT: MTRR not enabled\n");
         return FALSE;
     }
 
@@ -432,7 +432,7 @@ ept_init(VOID)
         PVMM_EPT_PAGE_TABLE page_table = ept_alloc_identity_map();
         if (!page_table)
         {
-            DbgPrintEx(0, 0, "[hv] EPT: Failed to allocate page table for core %u\n", i);
+            HV_LOG(0, 0, "[hv] EPT: Failed to allocate page table for core %u\n", i);
             return FALSE;
         }
 
@@ -460,7 +460,7 @@ ept_init(VOID)
         g_vcpu[i].ept_pointer = eptp;
     }
 
-    DbgPrintEx(0, 0, "[hv] EPT initialized for %u processors\n", g_cpu_count);
+    HV_LOG(0, 0, "[hv] EPT initialized for %u processors\n", g_cpu_count);
     return TRUE;
 }
 
@@ -667,7 +667,7 @@ ept_setup_timer_hooks(VOID)
 
     if (!g_ept->mtf_supported)
     {
-        DbgPrintEx(0, 0,
+        HV_LOG(0, 0,
             "[hv] Timer MMIO virtualization disabled: MTF unavailable\n");
         return TRUE;
     }
@@ -692,7 +692,7 @@ ept_setup_timer_hooks(VOID)
                     g_ept->hpet_counter_64bit
                         ? sizeof(UINT64) : sizeof(UINT32)))
             {
-                DbgPrintEx(0, 0,
+                HV_LOG(0, 0,
                     "[hv] HPET virtualization unavailable; continuing without MMIO timing hooks\n");
                 ept_destroy_timer_hooks();
                 return TRUE;
@@ -710,7 +710,7 @@ ept_setup_timer_hooks(VOID)
                     vcpu, &vcpu->lapic_hook, EptMmioLapic,
                     apic_physical, XAPIC_CURRENT_COUNT_OFFSET, sizeof(UINT32)))
             {
-                DbgPrintEx(0, 0,
+                HV_LOG(0, 0,
                     "[hv] xAPIC virtualization unavailable; continuing without MMIO timing hooks\n");
                 ept_destroy_timer_hooks();
                 return TRUE;

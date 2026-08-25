@@ -2,8 +2,13 @@
 *   driver.c - windows kernel driver entry point for the hypervisor
 *   creates a device object, symbolic link, and initializes vmx
 *   provides ioctl interface for usermode loader communication
+*
+*   production builds create no device object, no symbolic link, and no
+*   dispatch table: nothing for module/device enumeration to fingerprint.
 */
 #include "hv.h"
+
+#if !OPHION_PRODUCTION
 
 #define DEVICE_NAME     L"\\Device\\Ophion"
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
@@ -17,7 +22,7 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
     UNICODE_STRING symlink;
 
-    DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
+    HV_LOG(0, 0, "[hv] Unloading hypervisor driver...\n");
 
     broadcast_terminate_all();
     vmx_terminate();
@@ -30,7 +35,7 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
         IoDeleteDevice(driver_obj->DeviceObject);
     }
 
-    DbgPrintEx(0, 0, "[hv] Driver unloaded.\n");
+    HV_LOG(0, 0, "[hv] Driver unloaded.\n");
 }
 
 NTSTATUS
@@ -45,7 +50,7 @@ DriverEntry(
 
     UNREFERENCED_PARAMETER(registry_path);
 
-    DbgPrintEx(0, 0, "[hv] Ophion initializing...\n");
+    HV_LOG(0, 0, "[hv] Ophion initializing...\n");
 
     RtlInitUnicodeString(&device_name, DEVICE_NAME);
     status = IoCreateDevice(
@@ -59,7 +64,7 @@ DriverEntry(
 
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(0, 0, "[hv] IoCreateDevice failed: 0x%X\n", status);
+        HV_LOG(0, 0, "[hv] IoCreateDevice failed: 0x%X\n", status);
         return status;
     }
 
@@ -68,7 +73,7 @@ DriverEntry(
 
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(0, 0, "[hv] IoCreateSymbolicLink failed: 0x%X\n", status);
+        HV_LOG(0, 0, "[hv] IoCreateSymbolicLink failed: 0x%X\n", status);
         IoDeleteDevice(device_obj);
         return status;
     }
@@ -80,14 +85,14 @@ DriverEntry(
 
     if (!vmx_init())
     {
-        DbgPrintEx(0, 0, "[hv] VMX initialization FAILED!\n");
+        HV_LOG(0, 0, "[hv] VMX initialization FAILED!\n");
         vmx_terminate();  // clean up any partially-allocated resources
         IoDeleteSymbolicLink(&symlink);
         IoDeleteDevice(device_obj);
         return STATUS_HV_OPERATION_FAILED;
     }
 
-    DbgPrintEx(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
+    HV_LOG(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
     return STATUS_SUCCESS;
 }
 
@@ -225,3 +230,38 @@ DriverIoControl(
     IoCompleteRequest(irp, IO_NO_INCREMENT);
     return status;
 }
+
+#else // OPHION_PRODUCTION
+
+//
+// production entry: virtualize and leave. no device object, no symlink, no
+// dispatch table — module/device/service enumerators see nothing to query.
+// teardown for a mapped image is driven by VMCALL_VMXOFF per core.
+//
+NTSTATUS
+DriverEntry(
+    _In_ PDRIVER_OBJECT  driver_obj,
+    _In_ PUNICODE_STRING registry_path)
+{
+    UNREFERENCED_PARAMETER(driver_obj);
+    UNREFERENCED_PARAMETER(registry_path);
+
+    if (!vmx_init())
+    {
+        vmx_terminate();
+        return STATUS_HV_OPERATION_FAILED;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+VOID
+DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
+{
+    UNREFERENCED_PARAMETER(driver_obj);
+
+    broadcast_terminate_all();
+    vmx_terminate();
+}
+
+#endif // OPHION_PRODUCTION

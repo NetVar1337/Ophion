@@ -110,6 +110,15 @@ pwsh -NoProfile -File .\build.ps1 -Configuration Debug -CodeAnalysis
 pwsh -NoProfile -File .\build.ps1 -WdkVersion $env:OPHION_WDK_VERSION
 ```
 
+### Production stealth profile
+
+`-Production` compiles `OPHION_PRODUCTION=1`: the status device, symbolic link, IOCTL dispatch, and every diagnostic log string are compiled out, the pool tag is replaced with a non-identifying one, and the embedded PDB reference is neutralized to `driver.pdb`. Per-exit state sampling (debug registers, CR8, APERF/MPERF, LAPIC counters) is reason-conditional in all profiles. The binary contains no device path, log text, build-machine path, or project-name string:
+
+```powershell
+pwsh -NoProfile -File .\build.ps1 -Configuration Release -Clean -WarningsAsErrors -Production
+# -> build\bin\Release\Ophion-production.sys
+```
+
 The output is `build\bin\<Configuration>\Ophion.sys`. The script verifies that it is an x64 Native PE. Default output is unsigned. Signing is opt-in and the SHA1 certificate thumbprint is injected at invocation time:
 
 ```powershell
@@ -206,8 +215,8 @@ Evidence status as of **2026-08-25**:
 |---|---:|---:|---|
 | Portable unsigned driver build | Yes | No | Release and Debug x64 built with WDK 10.0.26100.0 and `/WX`; Native x64 PE headers verified by `build.ps1`. |
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
-| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 135 assertions. |
-| `ophion.probe.v1` utility | Yes | Baseline only | Release x64 probe compiled with `/WX`; unloaded run emitted valid JSON for all 16 logical processors and correctly reported the absent driver (`ERROR_FILE_NOT_FOUND`). |
+| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 145 assertions. |
+| Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
 | VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
 | Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
 | EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |

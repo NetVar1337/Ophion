@@ -9,6 +9,21 @@
 #include <ntifs.h>
 #include <intrin.h>
 
+//
+// production stealth profile: defined via /DOPHION_PRODUCTION=1 at build
+// time. removes diagnostic logging and the status device entirely; default
+// (0) keeps the diagnosable, probe-friendly build unchanged.
+//
+#ifndef OPHION_PRODUCTION
+#define OPHION_PRODUCTION 0
+#endif
+
+#if OPHION_PRODUCTION
+#define HV_LOG(...) ((void)0)
+#else
+#define HV_LOG(...) DbgPrintEx(__VA_ARGS__)
+#endif
+
 #include "ia32.h"
 #include "hv_public.h"
 #include "hv_types.h"
