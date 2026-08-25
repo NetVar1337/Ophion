@@ -10,6 +10,7 @@
 #include <intrin.h>
 
 #include "ia32.h"
+#include "hv_public.h"
 #include "hv_types.h"
 #include "asm_prototypes.h"
 #include "stealth.h"
@@ -42,8 +43,14 @@ VOID    hostgdt_destroy_for_vcpu(VIRTUAL_MACHINE_STATE * vcpu);
 // segment helpers (segment.c)
 //
 VOID segment_get_descriptor(PUCHAR gdt_base, UINT16 selector, VMX_SEGMENT_SELECTOR * result);
-VOID segment_fill_vmcs(PVOID gdt_base, UINT32 seg_reg, UINT16 selector);
+BOOLEAN segment_fill_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID gdt_base, UINT32 seg_reg, UINT16 selector);
 
+BOOLEAN vmx_preflight(VOID);
+BOOLEAN vmx_build_topology(VOID);
+UINT32  vmx_topology_index(const PROCESSOR_NUMBER * processor);
+BOOLEAN vmx_vmread_checked(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T field, UINT64 * value);
+BOOLEAN vmx_vmwrite_checked(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T field, UINT64 value);
+VOID    vmx_mark_host_nmi_pending(VIRTUAL_MACHINE_STATE * vcpu);
 BOOLEAN vmx_check_support(VOID);
 BOOLEAN vmx_init(VOID);
 VOID    vmx_terminate(VOID);
@@ -59,8 +66,6 @@ BOOLEAN vmx_load_vmcs(VIRTUAL_MACHINE_STATE * vcpu);
 UINT32  vmx_adjust_controls(UINT32 requested, UINT32 capability_msr);
 VOID    vmx_set_fixed_bits(VOID);
 VOID    vmx_vmresume(VOID);
-UINT64  vmx_return_rsp_for_vmxoff(VOID);
-UINT64  vmx_return_rip_for_vmxoff(VOID);
 
 BOOLEAN ept_check_features(VOID);
 BOOLEAN ept_build_mtrr_map(VOID);
@@ -75,12 +80,13 @@ PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_split_large_page(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T phys_addr);
 BOOLEAN ept_setup_timer_hooks(VOID);
 VOID    ept_destroy_timer_hooks(VOID);
+VOID    ept_destroy_splits(VOID);
 BOOLEAN ept_handle_mmio_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys);
 VOID    ept_handle_monitor_trap(VIRTUAL_MACHINE_STATE * vcpu);
 
-VOID ept_invept_single(EPT_POINTER ept_ptr);
-VOID ept_invept_all(VOID);
-VOID vpid_invvpid_single(UINT16 vpid);
+BOOLEAN ept_invept_single(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN ept_invept_all(VIRTUAL_MACHINE_STATE * vcpu);
+BOOLEAN vpid_invvpid_single(VIRTUAL_MACHINE_STATE * vcpu, UINT16 vpid);
 
 BOOLEAN vmexit_handler(PGUEST_REGS regs, VIRTUAL_MACHINE_STATE * vcpu);
 

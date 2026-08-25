@@ -2,6 +2,10 @@
 *   vmexit.c - vm-exit handler dispatches exits to sub-handlers
 */
 #include "hv.h"
+static VOID vmexit_enter_terminal(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    UINT32 failure);
+
 
 static __forceinline VOID
 vmexit_advance_rip(VIRTUAL_MACHINE_STATE * vcpu)
@@ -237,21 +241,6 @@ parent_hyperv_msr_supported(UINT32 msr, BOOLEAN write)
     }
 }
 
-UINT64
-vmx_return_rsp_for_vmxoff(VOID)
-{
-    UINT32                  core_id = (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
-    VIRTUAL_MACHINE_STATE * vcpu   = &g_vcpu[core_id];
-    return vcpu->vmxoff.guest_rsp;
-}
-
-UINT64
-vmx_return_rip_for_vmxoff(VOID)
-{
-    UINT32                  core_id = (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
-    VIRTUAL_MACHINE_STATE * vcpu   = &g_vcpu[core_id];
-    return vcpu->vmxoff.guest_rip;
-}
 
 #define VMXOFF_SAVED_RFLAGS_OFFSET 0x190
 #define VMXOFF_RETURN_RSP_OFFSET   0x1A0
@@ -917,11 +906,25 @@ VOID
 vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UINT64 guest_phys = 0;
-    __vmx_vmread(VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys);
+    if (!vmx_vmread_checked(
+            vcpu, VMCS_GUEST_PHYSICAL_ADDRESS, &guest_phys))
+    {
+        vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+        return;
+    }
 
     if (ept_handle_mmio_violation(vcpu, guest_phys))
     {
         vcpu->advance_rip = FALSE;
+        return;
+    }
+    if (vcpu->terminal)
+    {
+        vmexit_enter_terminal(
+            vcpu,
+            vcpu->last_failure
+                ? vcpu->last_failure
+                : HV_FAILURE_INVEPT);
         return;
     }
 
@@ -980,11 +983,39 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     }
 }
 
+static VOID
+vmexit_enter_terminal(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    UINT32 failure)
+{
+    vcpu->failed = TRUE;
+    vcpu->terminal = TRUE;
+    vcpu->last_failure = failure;
+    vcpu->advance_rip = FALSE;
+    vmx_vmwrite_checked(
+        vcpu,
+        VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD,
+        0);
+    vmx_vmwrite_checked(
+        vcpu,
+        VMCS_GUEST_ACTIVITY_STATE,
+        GUEST_ACTIVITY_STATE_SHUTDOWN);
+}
+static __forceinline HV_CPUID_LEAF_CLASS
+vmexit_cpuid_leaf_class(UINT32 leaf)
+{
+    if (leaf >= 0x80000000U)
+        return HvCpuidLeafExtended;
+    if (leaf == 7 || leaf == 0x0D || leaf == 0x14 || leaf == 0x1F)
+        return HvCpuidLeafStructured;
+    return HvCpuidLeafBasic;
+}
+
+
 VOID
 vmexit_handle_triple_fault(VIRTUAL_MACHINE_STATE * vcpu)
 {
-    UNREFERENCED_PARAMETER(vcpu);
-    vcpu->advance_rip = FALSE;
+    vmexit_enter_terminal(vcpu, HV_FAILURE_TRIPLE_FAULT);
 }
 
 //
@@ -1113,9 +1144,16 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     vcpu->guest_cr8 = (UINT8)__readcr8();
 
     // __vmx_vmread writes size_t
-    __vmx_vmread(VMCS_EXIT_REASON, &exit_raw);
+    if (!vmx_vmread_checked(vcpu, VMCS_EXIT_REASON, &exit_raw))
+    {
+        vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+        return FALSE;
+    }
     exit_reason = (UINT32)(exit_raw & 0xFFFF);
     vcpu->exit_reason = exit_reason;
+    vcpu->total_exits++;
+    if (exit_reason < HV_STATUS_EXIT_REASON_COUNT)
+        vcpu->exit_counters[exit_reason]++;
 
     // A different exit can preempt the MTF retry window. Fail closed and
     // let the original MMIO instruction fault/re-arm when it is retried.
@@ -1123,6 +1161,16 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         exit_reason != VMX_EXIT_REASON_MONITOR_TRAP_FLAG)
     {
         ept_handle_monitor_trap(vcpu);
+        if (vcpu->terminal)
+        {
+            vmexit_enter_terminal(
+                vcpu,
+                vcpu->last_failure
+                    ? vcpu->last_failure
+                    : HV_FAILURE_INVEPT);
+            vcpu->in_root = FALSE;
+            return FALSE;
+        }
     }
 
     //
@@ -1163,15 +1211,25 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->lapic_root_bias = 0;
     }
 
-    __vmx_vmread(VMCS_GUEST_RIP, &vcpu->vmexit_rip);
-    __vmx_vmread(VMCS_GUEST_RSP, &vcpu->regs->rsp);
-    __vmx_vmread(VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual);
+    if (!vmx_vmread_checked(vcpu, VMCS_GUEST_RIP, &vcpu->vmexit_rip) ||
+        !vmx_vmread_checked(vcpu, VMCS_GUEST_RSP, &vcpu->regs->rsp) ||
+        !vmx_vmread_checked(vcpu, VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual))
+    {
+        vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+        return FALSE;
+    }
 
     switch (exit_reason)
     {
     case VMX_EXIT_REASON_TRIPLE_FAULT:
         vmexit_handle_triple_fault(vcpu);
         break;
+    case VMX_EXIT_REASON_VMENTRY_FAILURE_GUEST_STATE:
+    case VMX_EXIT_REASON_VMENTRY_FAILURE_MSR_LOADING:
+    case VMX_EXIT_REASON_VMENTRY_FAILURE_MACHINE_CHECK:
+        vmexit_enter_terminal(vcpu, HV_FAILURE_VM_ENTRY);
+        break;
+
 
     case VMX_EXIT_REASON_EXECUTE_VMXON:
         // Cleanly leave Ophion and retry this VMXON against the underlying
@@ -1204,21 +1262,23 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EXECUTE_INVLPG:
     {
-        // flush combined (EPT+guest) TLB mapping for this linear address
         INVVPID_DESCRIPTOR desc = {0};
-        desc.Vpid          = VPID_TAG;
-        desc.LinearAddress = vcpu->exit_qual;
+        BOOLEAN invalidated = FALSE;
 
+        desc.Vpid = VPID_TAG;
+        desc.LinearAddress = vcpu->exit_qual;
         if (g_ept->invvpid_individual_addr)
+            invalidated =
+                asm_invvpid(InvvpidIndividualAddress, &desc) == 0;
+
+        if (!invalidated && g_ept->invvpid_all_contexts)
         {
-            UINT8 ret = asm_invvpid(InvvpidIndividualAddress, &desc);
-            if (ret != 0)
-                asm_invvpid(InvvpidAllContexts, &desc);
+            INVVPID_DESCRIPTOR all_contexts = {0};
+            invalidated =
+                asm_invvpid(InvvpidAllContexts, &all_contexts) == 0;
         }
-        else
-        {
-            asm_invvpid(InvvpidAllContexts, &desc);
-        }
+        if (!invalidated)
+            vmexit_enter_terminal(vcpu, HV_FAILURE_INVVPID);
         break;
     }
 
@@ -1265,8 +1325,12 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     case VMX_EXIT_REASON_EXECUTE_RDTSC:
     {
         UINT64 tsc = __rdtsc();
-        size_t offset_raw = 0;
-        __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &offset_raw);
+        UINT64 offset_raw = 0;
+        if (!vmx_vmread_checked(vcpu, VMCS_CTRL_TSC_OFFSET, &offset_raw))
+        {
+            vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+            break;
+        }
 
 #if STEALTH_COMPENSATE_TIMING
         if (vcpu->tsc_rdtsc_armed)
@@ -1275,17 +1339,23 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             // tsc_cpuid_entry is already offset-adjusted; expose only the
             // native CPUID instruction cost above that timestamp.
             //
-            tsc = vcpu->tsc_cpuid_entry
-                + g_stealth_cpuid_cache.bare_metal_cpuid_cost;
+            tsc = vcpu->tsc_cpuid_entry + vcpu->tsc_cpuid_cost;
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
             if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
             {
-                size_t proc_ctrl = 0;
-                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
-                proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
-                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+                UINT64 proc_ctrl = 0;
+                if (!vmx_vmread_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        &proc_ctrl) ||
+                    !vmx_vmwrite_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        proc_ctrl &
+                            ~(UINT64)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
+                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
             }
         }
         else
@@ -1294,6 +1364,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             tsc = (UINT64)((INT64)tsc + (INT64)offset_raw);
         }
 
+        if (tsc <= vcpu->tsc_last_value)
+            tsc = vcpu->tsc_last_value + 1;
+        vcpu->tsc_last_value = tsc;
+
         vcpu->regs->rax = tsc & 0xFFFFFFFF;
         vcpu->regs->rdx = tsc >> 32;
         break;
@@ -1301,6 +1375,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_EXECUTE_CPUID:
     {
+        UINT32 leaf = (UINT32)vcpu->regs->rax;
+        HV_CPUID_LEAF_CLASS leaf_class = vmexit_cpuid_leaf_class(leaf);
+        UINT64 jitter = vcpu->cpuid_jitter[leaf_class];
+
+        vcpu->tsc_cpuid_cost = vcpu->cpuid_cost[leaf_class];
+        if (jitter)
+            vcpu->tsc_cpuid_cost +=
+                vcpu->tsc_variance_sequence++ % (jitter + 1);
         vmexit_handle_cpuid(vcpu);
 
 #if STEALTH_COMPENSATE_TIMING
@@ -1311,10 +1393,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (g_stealth_enabled)
         {
-            size_t offset_raw = 0;
-            __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &offset_raw);
-            vcpu->tsc_cpuid_entry = (UINT64)(
-                (INT64)exit_tsc_start + (INT64)offset_raw);
+            UINT64 offset_raw = 0;
+            if (!vmx_vmread_checked(vcpu, VMCS_CTRL_TSC_OFFSET, &offset_raw))
+            {
+                vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+                break;
+            }
+            vcpu->tsc_cpuid_entry =
+                (UINT64)((INT64)exit_tsc_start + (INT64)offset_raw);
             vcpu->tsc_rdtsc_armed = TRUE;
             vcpu->root_tsc_bias = 0;
             vcpu->lapic_root_bias = 0;
@@ -1322,10 +1408,17 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
             if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
             {
-                size_t proc_ctrl = 0;
-                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
-                proc_ctrl |= (size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
-                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+                UINT64 proc_ctrl = 0;
+                if (!vmx_vmread_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        &proc_ctrl) ||
+                    !vmx_vmwrite_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        proc_ctrl |
+                            CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
+                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
             }
         }
 #endif
@@ -1354,22 +1447,20 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
         ept_handle_monitor_trap(vcpu);
+        if (vcpu->terminal)
+        {
+            vmexit_enter_terminal(
+                vcpu,
+                vcpu->last_failure
+                    ? vcpu->last_failure
+                    : HV_FAILURE_INVEPT);
+        }
         vcpu->advance_rip = FALSE;
         break;
 
     case VMX_EXIT_REASON_EPT_MISCONFIGURATION:
-    {
-        //
-        // EPT misconfiguration is a host-side fault — the EPT entry has
-        // invalid configuration (reserved bits, write-only, etc).
-        // the guest didn't cause this and can't handle it.
-        // enter shutdown state — system will triple-fault cleanly.
-        //
-        __vmx_vmwrite(VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD, 0);
-        __vmx_vmwrite(VMCS_GUEST_ACTIVITY_STATE, GUEST_ACTIVITY_STATE_SHUTDOWN);
-        vcpu->advance_rip = FALSE;
+        vmexit_enter_terminal(vcpu, HV_FAILURE_EPT_MISCONFIGURATION);
         break;
-    }
 
     case VMX_EXIT_REASON_EXECUTE_VMCALL:
         vmexit_handle_vmcall(vcpu);
@@ -1593,23 +1684,33 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     {
         unsigned int aux = 0;
         UINT64 tsc = __rdtscp(&aux);
-        size_t offset_raw = 0;
-        __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &offset_raw);
+        UINT64 offset_raw = 0;
+        if (!vmx_vmread_checked(vcpu, VMCS_CTRL_TSC_OFFSET, &offset_raw))
+        {
+            vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+            break;
+        }
 
 #if STEALTH_COMPENSATE_TIMING
         if (vcpu->tsc_rdtsc_armed)
         {
-            tsc = vcpu->tsc_cpuid_entry
-                + g_stealth_cpuid_cache.bare_metal_cpuid_cost;
+            tsc = vcpu->tsc_cpuid_entry + vcpu->tsc_cpuid_cost;
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
             if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
             {
-                size_t proc_ctrl = 0;
-                __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
-                proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
-                __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+                UINT64 proc_ctrl = 0;
+                if (!vmx_vmread_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        &proc_ctrl) ||
+                    !vmx_vmwrite_checked(
+                        vcpu,
+                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+                        proc_ctrl &
+                            ~(UINT64)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
+                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
             }
         }
         else
@@ -1617,6 +1718,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         {
             tsc = (UINT64)((INT64)tsc + (INT64)offset_raw);
         }
+
+        if (tsc <= vcpu->tsc_last_value)
+            tsc = vcpu->tsc_last_value + 1;
+        vcpu->tsc_last_value = tsc;
 
         vcpu->regs->rax = tsc & 0xFFFFFFFF;
         vcpu->regs->rdx = tsc >> 32;
@@ -1629,6 +1734,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
     default:
+        vmexit_enter_terminal(vcpu, HV_FAILURE_UNKNOWN_EXIT);
         break;
     }
 
@@ -1636,7 +1742,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     // re-inject IDT vectoring event if one was in progress during this VM-exit.
     // skip when vmxoff has been executed — vmread would #UD outside VMX.
     //
-    if (!vcpu->vmxoff.executed)
+    if (!vcpu->vmxoff.executed && !vcpu->terminal)
     {
         size_t idt_vec_raw = 0;
         __vmx_vmread(VMCS_IDT_VECTORING_INFORMATION, &idt_vec_raw);
@@ -1728,7 +1834,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
     // check for NMI that fired while in host mode (via private host IDT)
 #if USE_PRIVATE_HOST_IDT
-    if (!vcpu->vmxoff.executed && _InterlockedExchange(&g_host_nmi_pending[vcpu->core_id], 0))
+    if (!vcpu->vmxoff.executed && !vcpu->terminal &&
+        _InterlockedExchange(&vcpu->host_nmi_pending, 0))
     {
         if (!vcpu->has_pending_nmi)
         {
@@ -1770,8 +1877,7 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
             if (exit_reason == VMX_EXIT_REASON_EXECUTE_CPUID)
             {
-                UINT64 native_cost =
-                    g_stealth_cpuid_cache.bare_metal_cpuid_cost;
+                UINT64 native_cost = vcpu->tsc_cpuid_cost;
                 hidden_delta = root_delta > native_cost
                     ? root_delta - native_cost
                     : 0;

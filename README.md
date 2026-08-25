@@ -1,7 +1,7 @@
 # Ophion
 <div align="center"> <img src="logo.png" alt="Demo" width="800"/> </div>
 
-Intel VT-x Type-2 hypervisor that virtualizes an already running Windows system. Designed for stealth: passes common hypervisor detection checks and works with **EAC/BE/AVs out of the box.** (possibly more, these are the only that have been tested)
+Intel VT-x Type-2 hypervisor research code for virtualizing an already running Windows system. The feature list below describes implemented code paths; detector compatibility and production stability are not implied. Current evidence is tracked explicitly in the evidence matrix.
 
 
 ***
@@ -97,32 +97,63 @@ asm/
 
 ## Building
 
-Requires Visual Studio 2022, WDK 10.0.26100.0, and MSVC with MASM (x64).
+The portable build requires Visual Studio 2022 C++ tools and an installed Windows Driver Kit containing x64 kernel headers and libraries. It discovers `vswhere`, the newest x64 MSVC toolset, and the newest suitable WDK; it does not require the WDK Visual Studio extension.
 
-```bash
-MSBuild.exe Ophion.sln /p:Configuration=Release /p:Platform=x64
+```powershell
+# Unsigned Release build, clean first, with compiler and MASM warnings fatal
+pwsh -NoProfile -File .\build.ps1 -Configuration Release -Clean -WarningsAsErrors
+
+# Debug plus MSVC code analysis
+pwsh -NoProfile -File .\build.ps1 -Configuration Debug -CodeAnalysis
+
+# Select an installed WDK explicitly
+pwsh -NoProfile -File .\build.ps1 -WdkVersion $env:OPHION_WDK_VERSION
 ```
 
-Output: `build\bin\Release\Ophion.sys` (test-signed).
+The output is `build\bin\<Configuration>\Ophion.sys`. The script verifies that it is an x64 Native PE. Default output is unsigned. Signing is opt-in and the SHA1 certificate thumbprint is injected at invocation time:
+
+```powershell
+pwsh -NoProfile -File .\build.ps1 -Configuration Release `
+  -CertificateThumbprint $env:OPHION_CERT_SHA1 `
+  -TimestampUrl $env:OPHION_TIMESTAMP_URL
+```
+
+The signing path checks the resulting signer thumbprint and runs kernel-policy signature verification. For a Visual Studio WDK-integrated build, the project remains usable directly:
+
+```powershell
+msbuild .\Ophion.sln /m /p:Configuration=Release /p:Platform=x64
+
+# Optional project-level WDK selection and signing
+msbuild .\Ophion.sln /m /p:Configuration=Release /p:Platform=x64 `
+  /p:OphionWdkVersion=$env:OPHION_WDK_VERSION `
+  /p:OphionCertificateThumbprint=$env:OPHION_CERT_SHA1
+```
+
+Run the dependency-free contract assertions separately:
+
+```powershell
+pwsh -NoProfile -File .\tests\contracts.ps1
+```
+
+GitHub-hosted Windows CI runs the contract assertions and builds the user-mode probe. It does not compile the driver because the hosted image does not guarantee WDK kernel headers and libraries.
 
 ***
-
 ## Loading
 
-```bash
-sc create Ophion type= kernel binPath= "C:\path\to\Ophion.sys"
-sc start Ophion
+Loading is intentionally not automated. An administrator can register a driver produced or signed for the target machine:
+
+```powershell
+$driver = (Resolve-Path .\build\bin\Release\Ophion.sys).Path
+sc.exe create Ophion type= kernel binPath= $driver
+sc.exe start Ophion
+
+sc.exe stop Ophion
+sc.exe delete Ophion
 ```
 
-Requires test signing enabled (`bcdedit /set testsigning on`).
-
-```bash
-sc stop Ophion
-sc delete Ophion
-```
+The default build is unsigned and will not load under normal Windows kernel-signing policy. Test-signing policy and certificate provisioning are operator-managed prerequisites.
 
 ***
-
 ## Stealth Toggles
 
 Defined in `include/stealth.h`:
@@ -141,21 +172,46 @@ Defined in `include/stealth.h`:
 
 ***
 
-## Tested On
+## Runtime probe
 
-- Intel Core i5-14400F (14th Generation), Windows 10 x64
+The x64 user-mode probe is read-only: it opens `\\.\Ophion`, requests `HV_STATUS_V1` with a legacy `UINT32` fallback, pins its thread to every active group-aware logical processor, and emits CPUID and timing samples as JSON. It does not load a driver, write an MSR, or change system configuration.
 
-***
+```powershell
+pwsh -NoProfile -File .\tools\build-probe.ps1 -Configuration Release -WarningsAsErrors
+.\build\bin\Release\OphionProbe.exe --samples 1000 |
+  Set-Content .\build\probe.json -Encoding utf8
+```
 
-## Detection Tests
+The stable top-level schema identifier is `ophion.probe.v1`. Each processor record contains the processor group/number, CPUID leaf 1, Hyper-V base/interface leaves, two invalid-leaf responses, and paired `RDTSC-CPUID-RDTSC`/QPC deltas.
 
-Passes with all stealth toggles enabled:
+## Pinned detector sources
 
-- [hvdetecc](https://github.com/can1357/hvdetecc) — CR4.VMXE shadow, MSR 0x10 interception, CPUID timing
-- [VMAware](https://github.com/kernelwernel/VMAware) — DR trap (DR0 + TF on CPUID, DR6 BS+B0), CPUID checks
-- [checkhv_um](https://github.com/zer0condition/checkhv_um) — RDTSC+CPUID+RDTSC timing, CPUID leaf enumeration, brand string
+`tools\detectors.json` pins public detector repositories and records their expected build command and result artifact. The management script never executes detector binaries. Without `-Fetch` it performs no network activity:
 
-![VMAware](vmaware.png)
+```powershell
+# Inspect already-present checkouts only
+pwsh -NoProfile -File .\tools\detectors.ps1
+
+# Explicitly clone/fetch and detach each checkout at its pinned revision
+pwsh -NoProfile -File .\tools\detectors.ps1 -Fetch
+```
+
+The manifest covers VMAware, hvdetecc, checkhv_um, void-stack Hypervisor-Detection, and momo5502 EPT hook detection.
+
+## Evidence matrix
+
+Evidence status as of **2026-08-25**:
+
+| Scope or claim | Compile-verified | Runtime-verified | Evidence / limit |
+|---|---:|---:|---|
+| Portable unsigned driver build | Yes | No | Release and Debug x64 built with WDK 10.0.26100.0 and `/WX`; Native x64 PE headers verified by `build.ps1`. |
+| Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
+| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 135 assertions. |
+| `ophion.probe.v1` utility | Yes | Baseline only | Release x64 probe compiled with `/WX`; unloaded run emitted valid JSON for all 16 logical processors and correctly reported the absent driver (`ERROR_FILE_NOT_FOUND`). |
+| VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
+| Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
+| EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |
+
 ***
 
 ## Disclaimer

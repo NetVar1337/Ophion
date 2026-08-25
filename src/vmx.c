@@ -5,17 +5,244 @@
 */
 #include "hv.h"
 
-/*
-*   get current processor id without windows apis
-*   ia32_tsc_aux (0xc0000103) is set by the os to the processor number
-*   safe to call in vmx-root mode. lower 12 bits = processor number
-*/
-static __forceinline UINT32
-vmx_get_cpu_id(VOID)
+UINT32
+vmx_topology_index(const PROCESSOR_NUMBER * processor)
 {
-    return (UINT32)(__readmsr(IA32_TSC_AUX) & 0xFFF);
+    if (!processor)
+        return MAX_PROCESSORS;
+
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        if (g_processor_topology[i].Processor.Group == processor->Group &&
+            g_processor_topology[i].Processor.Number == processor->Number)
+            return g_processor_topology[i].Index;
+    }
+    return MAX_PROCESSORS;
 }
 
+BOOLEAN
+vmx_build_topology(VOID)
+{
+    ULONG count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+
+    if (!count || count > MAX_PROCESSORS)
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_PROCESSOR_CAPACITY;
+        return FALSE;
+    }
+
+    RtlZeroMemory(g_processor_topology, sizeof(g_processor_topology));
+    g_cpu_count = count;
+    for (ULONG i = 0; i < count; i++)
+    {
+        if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(
+                i, &g_processor_topology[i].Processor)))
+        {
+            g_hv_capabilities.Failure = HV_FAILURE_PROCESSOR_CAPACITY;
+            g_cpu_count = 0;
+            return FALSE;
+        }
+        g_processor_topology[i].Index = i;
+    }
+    g_hv_capabilities.CpuCount = count;
+    return TRUE;
+}
+
+BOOLEAN
+vmx_preflight(VOID)
+{
+    CPUID data = {0};
+    INT32 cpu_info[4] = {0};
+    IA32_VMX_BASIC_REGISTER vmx_basic = {0};
+    IA32_VMX_EPT_VPID_CAP_REGISTER ept_vpid = {0};
+    MSR primary = {0};
+    MSR secondary = {0};
+    PPHYSICAL_MEMORY_RANGE ranges;
+
+    RtlZeroMemory(&g_hv_capabilities, sizeof(g_hv_capabilities));
+    if (!vmx_build_topology())
+        return FALSE;
+
+    __cpuid((int *)&data, CPUID_PROCESSOR_FEATURES);
+    if (!(data.ecx & (1U << CPUID_VMX_BIT)) ||
+        !vmx_check_support())
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_VMX_UNAVAILABLE;
+        return FALSE;
+    }
+
+    if (data.ecx & HYPERV_HYPERVISOR_PRESENT_BIT)
+    {
+        g_hv_capabilities.ParentFlags |= HV_PARENT_PRESENT;
+        __cpuidex(cpu_info, 0x40000000, 0);
+        RtlCopyMemory(&g_hv_capabilities.ParentVendor[0], &cpu_info[1], 12);
+        if ((UINT32)cpu_info[1] == 0x7263694D &&
+            (UINT32)cpu_info[2] == 0x666F736F &&
+            (UINT32)cpu_info[3] == 0x76482074)
+        {
+            g_hv_capabilities.ParentFlags |= HV_PARENT_HYPERV;
+            if ((UINT32)cpu_info[0] >= 0x40000003)
+            {
+                __cpuidex(cpu_info, 0x40000003, 0);
+                g_hv_capabilities.ParentFeatures = (UINT32)cpu_info[0];
+            }
+        }
+    }
+
+    __cpuidex(cpu_info, (INT32)0x80000000, 0);
+    if ((UINT32)cpu_info[0] >= 0x80000008)
+    {
+        __cpuidex(cpu_info, (INT32)0x80000008, 0);
+        g_hv_capabilities.PhysicalAddressBits = (UINT32)cpu_info[0] & 0xFF;
+    }
+
+    ranges = MmGetPhysicalMemoryRanges();
+    if (!ranges)
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_GPA_COVERAGE;
+        return FALSE;
+    }
+    for (PPHYSICAL_MEMORY_RANGE range = ranges; range->NumberOfBytes.QuadPart; range++)
+    {
+        UINT64 end = (UINT64)range->BaseAddress.QuadPart +
+                     (UINT64)range->NumberOfBytes.QuadPart;
+        if (end > g_hv_capabilities.MaximumGuestPhysicalAddress)
+            g_hv_capabilities.MaximumGuestPhysicalAddress = end;
+    }
+    ExFreePool(ranges);
+
+    if (g_hv_capabilities.MaximumGuestPhysicalAddress >
+        (1ULL << 39))
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_GPA_COVERAGE;
+        return FALSE;
+    }
+
+    vmx_basic.AsUInt = __readmsr(IA32_VMX_BASIC);
+    primary.Flags = __readmsr(vmx_basic.VmxControls
+        ? IA32_VMX_TRUE_PROCBASED_CTLS
+        : IA32_VMX_PROCBASED_CTLS);
+    secondary.Flags = __readmsr(IA32_VMX_PROCBASED_CTLS2);
+    ept_vpid.AsUInt = __readmsr(IA32_VMX_EPT_VPID_CAP);
+
+    if (!(primary.Fields.High &
+          CPU_BASED_VM_EXEC_CTRL_ACTIVATE_SECONDARY_CONTROLS) ||
+        !(secondary.Fields.High & CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT))
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_REQUIRED_CONTROLS;
+        if (g_hv_capabilities.ParentFlags & HV_PARENT_PRESENT)
+            g_hv_capabilities.ParentFlags |= HV_PARENT_NESTED_RESTRICTED;
+        return FALSE;
+    }
+    if (!ept_vpid.PageWalkLength4 || !ept_vpid.MemoryTypeWriteBack ||
+        !ept_vpid.Pde2MbPages)
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_EPT_UNAVAILABLE;
+        if (g_hv_capabilities.ParentFlags & HV_PARENT_PRESENT)
+            g_hv_capabilities.ParentFlags |= HV_PARENT_NESTED_RESTRICTED;
+        return FALSE;
+    }
+
+    g_hv_capabilities.CapabilityFlags =
+        HV_CAP_EPT | HV_CAP_EPT_2MB;
+    if (ept_vpid.EptAccessedAndDirtyFlags)
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_EPT_AD;
+    if (primary.Fields.High & CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG)
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_MTF;
+    if (ept_vpid.Invvpid)
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_INVVPID;
+    __cpuidex(cpu_info, 7, 0);
+    if (((UINT32)cpu_info[2] & (1U << 5)) &&
+        (secondary.Fields.High &
+         CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE))
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_WAITPKG;
+    __cpuidex(cpu_info, 0x0A, 0);
+    if ((cpu_info[0] & 0xFF) != 0)
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_PMU;
+
+    return TRUE;
+}
+
+BOOLEAN
+vmx_vmread_checked(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    SIZE_T field,
+    UINT64 * value)
+{
+    if (__vmx_vmread(field, value) == 0)
+        return TRUE;
+    if (vcpu)
+    {
+        UINT64 error = 0;
+        vcpu->failed = TRUE;
+        vcpu->last_failure = HV_FAILURE_VMCS_READ;
+        if (__vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error) == 0)
+            vcpu->last_vm_instruction_error = (UINT32)error;
+    }
+    return FALSE;
+}
+
+BOOLEAN
+vmx_vmwrite_checked(
+    VIRTUAL_MACHINE_STATE * vcpu,
+    SIZE_T field,
+    UINT64 value)
+{
+    if (__vmx_vmwrite(field, value) == 0)
+        return TRUE;
+    if (vcpu)
+    {
+        UINT64 error = 0;
+        vcpu->failed = TRUE;
+        vcpu->last_failure = HV_FAILURE_VMCS_WRITE;
+        if (__vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error) == 0)
+            vcpu->last_vm_instruction_error = (UINT32)error;
+    }
+    return FALSE;
+}
+
+VOID
+vmx_mark_host_nmi_pending(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    if (vcpu)
+        InterlockedExchange(&vcpu->host_nmi_pending, 1);
+}
+
+
+static VOID
+vmx_calibrate_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    static const UINT32 leaves[HvCpuidLeafClassCount] = {
+        0, 7, 0x80000000U
+    };
+    INT32 cpu_info[4];
+
+    for (UINT32 leaf_class = 0;
+         leaf_class < HvCpuidLeafClassCount;
+         leaf_class++)
+    {
+        UINT64 minimum = MAXULONG64;
+        UINT64 maximum = 0;
+
+        for (UINT32 sample = 0; sample < 32; sample++)
+        {
+            UINT32 aux;
+            UINT64 start = __rdtsc();
+            __cpuidex(cpu_info, (INT32)leaves[leaf_class], 0);
+            UINT64 elapsed = __rdtscp(&aux) - start;
+            if (elapsed < minimum)
+                minimum = elapsed;
+            if (elapsed > maximum)
+                maximum = elapsed;
+        }
+
+        vcpu->cpuid_cost[leaf_class] = minimum;
+        vcpu->cpuid_jitter[leaf_class] =
+            maximum > minimum ? maximum - minimum : 0;
+        if (vcpu->cpuid_jitter[leaf_class] > minimum / 4)
+            vcpu->cpuid_jitter[leaf_class] = minimum / 4;
+    }
+}
 BOOLEAN
 vmx_check_support(VOID)
 {
@@ -155,6 +382,9 @@ vmx_load_vmcs(VIRTUAL_MACHINE_STATE * vcpu)
     return TRUE;
 }
 
+#define __vmx_vmwrite(Field, Value) \
+    vmx_vmwrite_checked(vcpu, (Field), (UINT64)(Value))
+
 BOOLEAN
 vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 {
@@ -231,14 +461,15 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     vcpu->original_tr_selector = asm_get_tr();
 #endif
 
-    segment_fill_vmcs((PVOID)gdt_base, ES,   asm_get_es());
-    segment_fill_vmcs((PVOID)gdt_base, CS,   asm_get_cs());
-    segment_fill_vmcs((PVOID)gdt_base, SS,   asm_get_ss());
-    segment_fill_vmcs((PVOID)gdt_base, DS,   asm_get_ds());
-    segment_fill_vmcs((PVOID)gdt_base, FS,   asm_get_fs());
-    segment_fill_vmcs((PVOID)gdt_base, GS,   asm_get_gs());
-    segment_fill_vmcs((PVOID)gdt_base, LDTR, asm_get_ldtr());
-    segment_fill_vmcs((PVOID)gdt_base, TR,   asm_get_tr());
+    if (!segment_fill_vmcs(vcpu, (PVOID)gdt_base, ES, asm_get_es()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, CS, asm_get_cs()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, SS, asm_get_ss()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, DS, asm_get_ds()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, FS, asm_get_fs()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, GS, asm_get_gs()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, LDTR, asm_get_ldtr()) ||
+        !segment_fill_vmcs(vcpu, (PVOID)gdt_base, TR, asm_get_tr()))
+        return FALSE;
 
     __vmx_vmwrite(VMCS_GUEST_FS_BASE, __readmsr(IA32_FS_BASE));
     __vmx_vmwrite(VMCS_GUEST_GS_BASE, __readmsr(IA32_GS_BASE));
@@ -469,8 +700,12 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     __vmx_vmwrite(VMCS_HOST_RSP, (UINT64)vcpu->vmm_stack + VMM_STACK_SIZE - 16);
     __vmx_vmwrite(VMCS_HOST_RIP, (UINT64)asm_vmexit_handler);
 
+    if (vcpu->failed)
+        return FALSE;
+
     return TRUE;
 }
+#undef __vmx_vmwrite
 
 /*
 *   called per-core via dpc — sets up vmx, enters vmx operation, launches
@@ -480,17 +715,26 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 BOOLEAN
 vmx_virtualize_cpu(PVOID guest_stack)
 {
-    ULONG                   core = KeGetCurrentProcessorNumberEx(NULL);
-    VIRTUAL_MACHINE_STATE * vcpu        = &g_vcpu[core];
-    UINT64                  error_code   = 0;
+    PROCESSOR_NUMBER processor;
+    UINT32 core;
+    VIRTUAL_MACHINE_STATE * vcpu;
+    UINT64 error_code = 0;
 
+    KeGetCurrentProcessorNumberEx(&processor);
+    core = vmx_topology_index(&processor);
+    if (!g_vcpu || core >= g_cpu_count)
+        return FALSE;
+    vcpu = &g_vcpu[core];
     vcpu->core_id = core;
+    vmx_calibrate_cpuid(vcpu);
 
     asm_enable_vmx();
     vmx_set_fixed_bits();
 
     if (__vmx_on(&vcpu->vmxon_pa))
     {
+        vcpu->failed = TRUE;
+        vcpu->last_failure = HV_FAILURE_VM_ENTRY;
         DbgPrintEx(0, 0, "[hv] VMXON failed on core %u\n", core);
         return FALSE;
     }
@@ -500,6 +744,9 @@ vmx_virtualize_cpu(PVOID guest_stack)
         !vmx_load_vmcs(vcpu) ||
         !vmx_setup_vmcs(vcpu, guest_stack))
     {
+        vcpu->failed = TRUE;
+        if (!vcpu->last_failure)
+            vcpu->last_failure = HV_FAILURE_VMCS_WRITE;
         DbgPrintEx(0, 0, "[hv] VMCS setup failed on core %u\n", core);
         __vmx_off();
         vcpu->vmxon_active = FALSE;
@@ -510,7 +757,10 @@ vmx_virtualize_cpu(PVOID guest_stack)
     __vmx_vmlaunch();
 
     vcpu->launched = FALSE;
-    __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
+    vcpu->failed = TRUE;
+    vcpu->last_failure = HV_FAILURE_VM_ENTRY;
+    if (__vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code) == 0)
+        vcpu->last_vm_instruction_error = (UINT32)error_code;
     __vmx_off();
     vcpu->vmxon_active = FALSE;
 
@@ -538,30 +788,28 @@ vmx_vmresume(VOID)
 BOOLEAN
 vmx_init(VOID)
 {
-    g_cpu_count = KeQueryActiveProcessorCount(0);
+    if (!vmx_preflight())
+    {
+        DbgPrintEx(0, 0, "[hv] VMX preflight failed: %u\n",
+                   g_hv_capabilities.Failure);
+        return FALSE;
+    }
+
+#if STEALTH_CPUID_CACHING
+    stealth_init_cpuid_cache();
+#endif
 
     g_vcpu = (VIRTUAL_MACHINE_STATE *)ExAllocatePool2(
         POOL_FLAG_NON_PAGED, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count, HV_POOL_TAG);
 
     if (!g_vcpu)
-        return FALSE;
-
-    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
-
-    if (!vmx_check_support())
     {
-        DbgPrintEx(0, 0, "[hv] VMX not supported!\n");
+        g_hv_capabilities.Failure = HV_FAILURE_ALLOCATION;
         return FALSE;
     }
 
-    //
-    // initialize stealth CPUID cache — MUST be before VMXON
-    // this captures bare-metal CPUID responses for invalid leaves
-    // so we can return consistent values when virtualizing.
-    //
-#if STEALTH_CPUID_CACHING
-    stealth_init_cpuid_cache();
-#endif
+    RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
+
 
     {
         KAPC_STATE apc_state;
@@ -729,6 +977,7 @@ vmx_terminate(VOID)
         return;
 
     ept_destroy_timer_hooks();
+    ept_destroy_splits();
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {

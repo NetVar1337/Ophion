@@ -5,8 +5,6 @@ PUBLIC asm_vmexit_handler
 
 EXTERN vmexit_handler:PROC
 EXTERN vmx_vmresume:PROC
-EXTERN vmx_return_rsp_for_vmxoff:PROC
-EXTERN vmx_return_rip_for_vmxoff:PROC
 
 .code _text
 

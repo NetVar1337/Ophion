@@ -58,7 +58,11 @@ dpc_terminate_guest(
     UNREFERENCED_PARAMETER(DeferredContext);
 
     {
-        ULONG core = KeGetCurrentProcessorNumberEx(NULL);
+        PROCESSOR_NUMBER processor;
+        UINT32 core;
+
+        KeGetCurrentProcessorNumberEx(&processor);
+        core = vmx_topology_index(&processor);
         if (g_vcpu && core < g_cpu_count &&
             g_vcpu[core].launched && !g_vcpu[core].detached)
         {

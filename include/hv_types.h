@@ -112,7 +112,34 @@ typedef struct _EPT_STATE {
     UINT64                tsc_frequency;
 } EPT_STATE, *PEPT_STATE;
 
+typedef struct _HV_PROCESSOR_TOPOLOGY_ENTRY {
+    PROCESSOR_NUMBER Processor;
+    UINT32           Index;
+} HV_PROCESSOR_TOPOLOGY_ENTRY, *PHV_PROCESSOR_TOPOLOGY_ENTRY;
+
+typedef struct _HV_CAPABILITY_RECORD {
+    UINT32 CpuCount;
+    UINT32 PhysicalAddressBits;
+    UINT64 MaximumGuestPhysicalAddress;
+    UINT32 ParentFlags;
+    UINT32 ParentFeatures;
+    UINT32 CapabilityFlags;
+    UINT32 Failure;
+    CHAR   ParentVendor[16];
+} HV_CAPABILITY_RECORD, *PHV_CAPABILITY_RECORD;
+
+typedef enum _HV_CPUID_LEAF_CLASS {
+    HvCpuidLeafBasic,
+    HvCpuidLeafStructured,
+    HvCpuidLeafExtended,
+    HvCpuidLeafClassCount
+} HV_CPUID_LEAF_CLASS;
+
+
 typedef struct _VIRTUAL_MACHINE_STATE {
+
+    // Kept first so the root NMI stub can set it without C/Windows calls.
+    volatile LONG host_nmi_pending;
 
     UINT64 vmxon_va;
     UINT64 vmxon_pa;
@@ -145,6 +172,13 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     BOOLEAN     detached;
     BOOLEAN     waitpkg_enabled;
     BOOLEAN     advance_rip;
+    BOOLEAN     failed;
+    BOOLEAN     terminal;
+    UINT32      last_failure;
+    UINT32      last_vm_instruction_error;
+    UINT64      total_exits;
+    UINT64      exit_counters[HV_STATUS_EXIT_REASON_COUNT];
+
 
     VMX_VMXOFF_STATE vmxoff;
 
@@ -156,6 +190,12 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     //
     UINT64  tsc_cpuid_entry;        // TSC recorded at start of CPUID VM-exit handler
     BOOLEAN tsc_rdtsc_armed;        // TRUE = next RDTSC/RDTSCP should be compensated
+    UINT64  cpuid_cost[HvCpuidLeafClassCount];
+    UINT64  cpuid_jitter[HvCpuidLeafClassCount];
+    UINT64  tsc_cpuid_cost;
+    UINT64  tsc_last_value;
+    UINT32  tsc_variance_sequence;
+
 
     //
     // PMU virtualization. PERF_GLOBAL_CTRL is loaded as zero on VM-exit and
@@ -234,8 +274,6 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_TEST             0x00000001
 #define VMCALL_VMXOFF           0x00000002
 
-// per-cpu NMI pending flag for host IDT NMI handler
-extern volatile LONG g_host_nmi_pending[MAX_PROCESSORS];
 
 typedef struct _HOST_IDT_STATE {
     DECLSPEC_ALIGN(16) IDT_GATE_DESCRIPTOR_64 idt[IDT_NUM_ENTRIES];
@@ -246,6 +284,8 @@ typedef struct _HOST_IDT_STATE {
 extern VIRTUAL_MACHINE_STATE * g_vcpu;
 extern EPT_STATE *             g_ept;
 extern UINT32                  g_cpu_count;
+extern HV_PROCESSOR_TOPOLOGY_ENTRY g_processor_topology[MAX_PROCESSORS];
+extern HV_CAPABILITY_RECORD        g_hv_capabilities;
 extern UINT64                  g_system_cr3;
 extern UINT64 *                g_msr_bitmap_invalid;
 extern HOST_IDT_STATE          g_host_idt;

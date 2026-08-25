@@ -8,8 +8,6 @@
 #define DEVICE_NAME     L"\\Device\\Ophion"
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
 
-#define IOCTL_BASE      0x800
-#define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
@@ -106,6 +104,76 @@ DriverCreateClose(
     return STATUS_SUCCESS;
 }
 
+static VOID
+DriverFillStatusV1(HV_STATUS_V1 * status)
+{
+    RtlZeroMemory(status, sizeof(*status));
+    status->Size = sizeof(*status);
+    status->Version = HV_STATUS_VERSION_1;
+    status->HeaderSize = FIELD_OFFSET(HV_STATUS_V1, Vcpu);
+    status->TotalProcessors = g_cpu_count;
+    status->ParentFlags = g_hv_capabilities.ParentFlags;
+    status->ParentFeatures = g_hv_capabilities.ParentFeatures;
+    status->CapabilityFlags = g_hv_capabilities.CapabilityFlags;
+    status->PreflightFailure = g_hv_capabilities.Failure;
+    status->PhysicalAddressBits = g_hv_capabilities.PhysicalAddressBits;
+    status->MaximumGuestPhysicalAddress =
+        g_hv_capabilities.MaximumGuestPhysicalAddress;
+    RtlCopyMemory(status->ParentVendor, g_hv_capabilities.ParentVendor,
+                  sizeof(status->ParentVendor));
+
+    for (UINT32 i = 0; i < g_cpu_count && i < HV_STATUS_MAX_VCPUS; i++)
+    {
+        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
+        HV_STATUS_VCPU_V1 * out = &status->Vcpu[i];
+
+        out->Size = sizeof(*out);
+        out->Index = i;
+        out->Group = g_processor_topology[i].Processor.Group;
+        out->Number = g_processor_topology[i].Processor.Number;
+        out->LastExitReason = vcpu->exit_reason;
+        out->LastExitQualification = vcpu->exit_qual;
+        out->LastFailure = vcpu->last_failure;
+        out->LastVmInstructionError = vcpu->last_vm_instruction_error;
+        out->TotalExits = vcpu->total_exits;
+        out->CpuidExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_CPUID];
+        out->EptViolationExits = vcpu->exit_counters[VMX_EXIT_REASON_EPT_VIOLATION];
+        out->MonitorTrapExits = vcpu->exit_counters[VMX_EXIT_REASON_MONITOR_TRAP_FLAG];
+        out->RdtscExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_RDTSC];
+        out->RdtscpExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_RDTSCP];
+        out->VmcallExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_VMCALL];
+        out->MsrReadExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_RDMSR];
+        out->MsrWriteExits = vcpu->exit_counters[VMX_EXIT_REASON_EXECUTE_WRMSR];
+
+        if (vcpu->launched) {
+            out->StateFlags |= HV_VCPU_LAUNCHED;
+            status->LaunchedProcessors++;
+        }
+        if (vcpu->detached) {
+            out->StateFlags |= HV_VCPU_DETACHED;
+            status->DetachedProcessors++;
+        }
+        if (vcpu->failed) {
+            out->StateFlags |= HV_VCPU_FAILED;
+            status->FailedProcessors++;
+        }
+        if (vcpu->terminal) {
+            out->StateFlags |= HV_VCPU_TERMINAL;
+            status->TerminalProcessors++;
+        }
+        if (vcpu->last_failure)
+            status->LastFailure = vcpu->last_failure;
+        if (vcpu->last_vm_instruction_error)
+            status->LastVmInstructionError = vcpu->last_vm_instruction_error;
+
+        for (UINT32 reason = 0;
+             reason < HV_STATUS_EXIT_REASON_COUNT;
+             reason++)
+            status->AggregateExitCounters[reason] +=
+                vcpu->exit_counters[reason];
+    }
+}
+
 static NTSTATUS
 DriverIoControl(
     _In_ PDEVICE_OBJECT device_obj,
@@ -124,10 +192,16 @@ DriverIoControl(
     {
     case IOCTL_HV_STATUS:
     {
-        //
-        // return basic status: number of virtualized cores
-        //
-        if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(UINT32))
+        ULONG output_length =
+            io_stack->Parameters.DeviceIoControl.OutputBufferLength;
+
+        if (output_length >= sizeof(HV_STATUS_V1))
+        {
+            DriverFillStatusV1(
+                (HV_STATUS_V1 *)irp->AssociatedIrp.SystemBuffer);
+            irp->IoStatus.Information = sizeof(HV_STATUS_V1);
+        }
+        else if (output_length >= sizeof(UINT32))
         {
             *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
             irp->IoStatus.Information = sizeof(UINT32);
