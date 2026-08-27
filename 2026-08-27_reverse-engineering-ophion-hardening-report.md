@@ -172,7 +172,7 @@ The following completed successfully:
 - `tools/build-map.ps1 -WarningsAsErrors`, `build-load.ps1`,
   `build-probe.ps1`, and `build-internal.ps1`.
 - CMake configure and Release build; `ctest` passed `1/1`.
-- `tests/contracts.ps1`: 261 assertions.
+- `tests/contracts.ps1`: 279 assertions.
 - `tests/mapper-artifact.ps1`: production happy path plus out-of-image and
   non-executable AEP rejection.
 - Attachment preflight, driver lifecycle, production boundary, research-case,
@@ -181,8 +181,58 @@ The following completed successfully:
 - Python EAC startup harness: 10 tests.
 - Skill frontmatter and all local Markdown links.
 - Manual QA: mapper `--help`; invalid AEP returned exit 1 with
-  `entry point is outside the mapped image`; production image emitted all six
-  artifacts and a valid `ophion.map.v2` manifest.
+  `entry point is outside the mapped image`; production image emitted all
+  seven artifacts, including the external all-core seal thunk, and a valid
+  `ophion.map.v2` manifest.
+
+## WebSec known-limitations follow-up
+
+The article
+<https://websec.net/blog/ophion-building-a-stealth-intel-vt-x-hypervisor-for-windows-69b62daa7462693131828c97>
+describes an older source state.
+
+| Published limitation | Current disposition |
+|---|---|
+| CR4.VMXE write/read mismatch | Resolved by preserving the guest-requested VMXE bit in the read shadow while forcing VMXE only in the actual VMCS CR4. |
+| Performance-counter timing | Root APERF/MPERF residency is now sampled and removed for every exit reason. Programmable PMCs use a zero host PERF_GLOBAL_CTRL and launch fails if host/guest control loading is unavailable. |
+| HPET/LAPIC wall-clock timing | HPET/xAPIC EPT hooks and x2APIC MSR handling are installed. Hook setup and TSC-frequency discovery fail closed, APIC mode is re-read, and an expired one-shot LAPIC timer remains visibly expired. Full interrupt-deadline virtualization remains open. |
+| Static private host CR3 | The optional private snapshot remains disabled, so staleness is not active. Its dormant builder now rejects capacity, mapping, and subtree-clone failures rather than publishing guest-shared branches. |
+| No EPT hooks | Superseded by timer MMIO hooks, production host-page concealment, and diagnostic execute-only/dummy protection views. |
+
+The follow-up EPT audit found a separate production-critical defect: the old
+all-core conceal DPC hid the mapped image and performed INVEPT before returning
+through `asm_vmx_vmcall`, whose post-VMCALL instructions are inside that image.
+The new protocol prepares but does not commit concealment in `DriverEntry`,
+bootstraps the capability from an external thunk, and commits each EPTP only
+from the authenticated external `ophion.seal.bin` thunk. The transport reaches
+ACTIVE only after all processors have acknowledged both concealment and seal.
+
+### Additional high-confidence gaps
+
+1. `tools/OphionMap.cpp` does not bound each DIR64 relocation write against
+   `SizeOfImage`, and malformed relocation block sizes are insufficiently
+   validated.
+2. Mapper import descriptor/thunk walks and export arrays are not fully
+   bounded by their directories and backing files.
+3. `hal.dll` imports are accepted but resolved through the ntoskrnl export
+   table.
+4. A race-safe live private-host-CR3 refresh protocol is not implemented;
+   private host CR3 therefore remains disabled.
+5. LAPIC/HPET count correction does not emulate complete timer deadline,
+   comparator, and interrupt-delivery state.
+6. EPT hooks exist, but production exposes no authenticated general code-hook
+   registration API; only fixed timer/concealment policies are active there.
+7. `platform::validate_scatter` does not reject virtual-address range wrap,
+   and transport record-size arithmetic lacks an explicit overflow guard.
+8. Mapper artifact writes do not verify directory creation and stream
+   completion before reporting success.
+9. Timer MMIO qualification has no instruction-width decoder. Exact counter
+   reads are virtualized and execute/RMW accesses now fail closed, but an
+   unusual overlapping read still needs hardware-backed differential testing.
+10. Concealed pages are readable as zero but reject writes and execution,
+    creating an active physical-access oracle relative to ordinary RAM.
+11. EPT+MTF timer/protection accesses remain measurable from another core;
+    local TSC bias does not hide a cross-core reference clock.
 
 ## Validation gaps
 
@@ -199,10 +249,17 @@ The following completed successfully:
 Ophion:
 
 - `src/vmexit.c`
+- `src/vmx.c`
+- `src/ept.c`
+- `src/hostcr3.c`
+- `src/root_transport.c`
+- `include/stealth.h`
 - `boot/OphionBootPkg/Application/VmxCore.c`
 - `tools/OphionMap.cpp`
 - `tests/contracts.ps1`
 - `tests/mapper-artifact.ps1`
+- `README.md`
+- `lab/HARDENING_EVIDENCE.md`
 - `lab/ophion-hardening-2026-08-27/scope.md`
 - `lab/ophion-hardening-2026-08-27/timeline.md`
 
@@ -214,3 +271,4 @@ Reusable skills:
 - `C:\Users\Admin\.agents\skills\hwid-identifier-surfaces\SKILL.md`
 - `C:\Users\Admin\.agents\skills\kevlar-driver-emulation\SKILL.md`
 - `C:\Users\Admin\.agents\skills\eac-kernel-driver-re\SKILL.md`
+- `C:\Users\Admin\.agents\skills\stealth-hypervisor\SKILL.md`

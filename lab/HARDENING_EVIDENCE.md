@@ -295,3 +295,38 @@ artifacts.
 Still not exercised: VMX launch/stop on hardware, an EDK2 boot build/run,
 Hyper-V provider commit, measured-boot preservation across a transition, and
 any EAC/BattlEye client or backend verdict path.
+
+## 2026-08-27 WebSec limitations follow-up
+
+- CR4.VMXE read-shadow semantics are preserved across guest writes while the
+  actual VMCS CR4 retains the VMXE bit required by VMX.
+- APERF/MPERF root residency is accounted on every VM exit. Programmable PMU
+  isolation now fails launch when host/guest PERF_GLOBAL_CTRL loading is
+  unavailable.
+- HPET/xAPIC hooks, x2APIC current-count interception, live APIC-mode refresh,
+  architectural CPUID.15H frequency gating, and one-shot expiry preservation
+  are source-contract covered. Timer hook setup, execute access, and mixed
+  RMW access fail closed.
+- Private host CR3 remains disabled. The dormant clone now fails on capacity,
+  mapping, and subtree-copy errors; safe enablement requires two complete
+  pre-conceal arenas and a two-pass all-core VMCS switch/observation protocol.
+- A production-critical EPT ordering defect was fixed: self-concealment no
+  longer commits from code that must return into the mapped image. Bootstrap
+  completes first, then `ophion.seal.bin` commits and acknowledges each EPTP
+  from an external authenticated all-core thunk.
+- `tests/contracts.ps1` passed 279 assertions. Mapper QA exercised `--help`,
+  MAC self-test, malformed placements/entry points, a valid production image,
+  and the 73-byte bootstrap, seal, and stop thunks.
+- Diagnostic and production WDK Release builds passed with warnings as errors.
+  SHA-256:
+  - `Ophion.sys`:
+    `9776BB4F085B73877D52FA9D63B27AA0200685A9983B1CF3A012FE4109EE6DF1`
+  - `Ophion-production.sys`:
+    `E791EDBA9584E27B4E2714FDBF8612518D94536C517B8E2185CA333AA72E6F91`
+  - `OphionMap.exe`:
+    `E8B87C9054B7C3DE4DC1A8B374E110F0F939B1439A025917A00B7C8FB1753064`
+- The full PowerShell/Python/CMake matrix passed: attachment preflight, driver
+  lifecycle, production boundary, mapper artifact, research case, TPM audit,
+  eight lifecycle-model tests, ten EAC-startup fixture tests, and CTest 1/1.
+- Not exercised: bare-metal VMX launch/return through the external seal path,
+  timer MMIO on hardware, live EAC/BattlEye behavior, or the full EDK2 build.

@@ -119,7 +119,7 @@ pwsh -NoProfile -File .\build.ps1 -WdkVersion $env:OPHION_WDK_VERSION
 
 ### Production stealth profile
 
-`-Production` compiles `OPHION_PRODUCTION=1`: the status device, symbolic link, IOCTL dispatch, and every diagnostic log string are compiled out, the pool tag is replaced with a non-identifying one, and the embedded PDB reference is neutralized to `driver.pdb`. Per-exit state sampling (debug registers, CR8, APERF/MPERF, LAPIC counters) is reason-conditional in all profiles. The binary contains no device path, log text, build-machine path, or project-name string:
+`-Production` compiles `OPHION_PRODUCTION=1`: the status device, symbolic link, IOCTL dispatch, and every diagnostic log string are compiled out, the pool tag is replaced with a non-identifying one, and the embedded PDB reference is neutralized to `driver.pdb`. Debug-register, CR8, and LAPIC sampling is reason-conditional; APERF/MPERF bracket every exit because those counters advance during all root residency. The binary contains no device path, log text, build-machine path, or project-name string:
 
 ```powershell
 pwsh -NoProfile -File .\build.ps1 -Configuration Release -Clean -WarningsAsErrors -Production
@@ -261,17 +261,24 @@ The mapper still does not allocate kernel memory or trigger execution; the exter
 write/execute primitive owns placement, invocation, and recovery.
 
 The runtime invokes `ophion.exec.bin` first, with the mapped `.hvshare` page
-still zeroed. `DriverEntry` launches VMX, snapshots root metadata, and prepares concealment
-before returning. After every vCPU acknowledges the conceal VMCALL, EPT maps
-all host-only allocations and the mapped production image to the dummy page;
-only the `.hvshare` command doorbell remains guest-visible for bootstrap and
-command VMCALLs. Only then does the runtime generate a nonzero
-128-bit capability with its OS CSPRNG, initialize `sharedPageRva` as state
-`WRITING`, patch `ophion.bootstrap.bin`, and invoke bootstrap VMCALL `7` on one
-virtualized processor. VMX-root copies the capability into already-concealed
-state and securely erases both the shared payload and its local copy. The
-runtime retains the capability, executes seal VMCALL `5` once on every logical
-processor, then uses VMCALL `0x100` with strictly increasing sequences.
+still zeroed. `DriverEntry` launches VMX, snapshots root metadata, freezes the
+concealment manifest, and returns without changing the guest EPT view. The
+runtime then generates a nonzero 128-bit capability with its OS CSPRNG,
+initializes `sharedPageRva` as state `WRITING`, patches
+`ophion.bootstrap.bin`, and invokes bootstrap VMCALL `7` on one virtualized
+processor. VMX-root copies the capability and securely erases both the shared
+payload and its local copy.
+
+The runtime retains the capability, patches `ophion.seal.bin`, and schedules
+seal VMCALL `5` synchronously on every logical processor. Each authenticated
+seal call commits the immutable concealment plan to that vCPU's EPTP before
+publishing its sealed bit. The final vCPU activates the transport only after
+all EPTPs acknowledge concealment. These calls return into the external seal
+thunk, not the now-hidden image: committing from an in-image DPC would make
+its own post-VMCALL return path NX. After sealing, EPT maps host-only
+allocations, `.hvroot`, and the mapped production image to the dummy page;
+only `.hvshare` remains guest-visible. The runtime then uses VMCALL `0x100`
+with strictly increasing sequences.
 Every READY command carries the manifest-declared `siphash-2-4x2-128` tag over
 command, epoch, sequence, lengths, and payload. VMX-root authenticates one local
 snapshot and signs every COMPLETE response over status, length, and payload;
@@ -336,11 +343,29 @@ Defined in `include/stealth.h`:
 | `STEALTH_CONCEAL_HOST_PAGES` | 1 | Hide VMXON/VMCS/bitmap/root-stack allocations behind a read-only zero page; production also hides fixed EPT controls and the mapped image after initialization, while `.hvshare` remains visible for authenticated VMCALLs |
 | `STEALTH_WIPE_LOADER_TRACES` | 0 | Experimental only: loader-list/cache edits can violate PatchGuard or live loader invariants |
 | `STEALTH_EAC_STACK_SCRUB` | 0 | Unsafe heuristic stack rewriting is disabled |
-| `USE_PRIVATE_HOST_CR3` | 0 | Disabled: dynamic post-launch allocations are not added to the deep copy |
+| `USE_PRIVATE_HOST_CR3` | 0 | Disabled until a bounded two-generation, all-core switch and observation protocol exists |
 | `USE_PRIVATE_HOST_IDT` | 1 | Isolated host IDT (prevents NMI hijacking in VMX-root) |
 | `USE_PRIVATE_HOST_GDT` | 1 | Per-core isolated host GDT |
 | `OPHION_ALLOW_UNLOAD` | 0 | Unload disabled until all vCPUs can prove VMXOFF completion |
 | `OPHION_ALLOW_NESTED` | 0 | Parent Hyper-V/VBS rejected because genuine hypercall pass-through is unavailable |
+
+### WebSec known-limitations status
+
+The March 2026
+[WebSec article](https://websec.net/blog/ophion-building-a-stealth-intel-vt-x-hypervisor-for-windows-69b62daa7462693131828c97)
+describes an older tree. The current branch has the following status:
+
+| Published limitation | Current status |
+|---|---|
+| CR4.VMXE write then read | Resolved. Initial reads hide host VMXE, but a guest write updates the CR4 read shadow with the guest-requested bit while the actual VMCS CR4 retains VMXE. |
+| RDPMC and APERF/MPERF | Resolved with a fail-closed ceiling. Root residency is excluded from APERF/MPERF on every VM exit, programmable counters load a zero host control, and launch fails if the required host/guest PERF_GLOBAL_CTRL controls are unavailable. |
+| HPET and LAPIC wall clocks | Partially resolved. HPET and xAPIC use EPT/MTF shadows, x2APIC current-count reads are intercepted, APIC mode transitions are re-evaluated, and hook setup fails closed. Full timer-interrupt deadline virtualization is not implemented. |
+| Private host CR3 staleness | Not active: `USE_PRIVATE_HOST_CR3` remains off. The dormant clone now rejects incomplete/shared branches. Enabling it requires a preallocated two-generation snapshot plus authenticated all-core VMCS switch; allocating replacement tables after conceal freeze is unsafe. |
+| No EPT hooks | Superseded. Timer MMIO, host-page concealment, and diagnostic execute-only/dummy protection all install 4 KB EPT leaf policies with MTF/INVEPT restoration. A general production inline-hook API is intentionally not exposed. |
+
+These are implementation properties, not EAC/BattlEye verdicts. The runtime
+evidence gate remains a version-pinned baseline, positive control, one changed
+variable, rollback, and backend outcome.
 
 
 ***

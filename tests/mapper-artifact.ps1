@@ -139,6 +139,7 @@ $jsonPath = Join-Path $outDir 'ophion.map.json'
 $mapPath = Join-Path $outDir 'ophion.map.bin'
 $thunkPath = Join-Path $outDir 'ophion.exec.bin'
 $bootstrapPath = Join-Path $outDir 'ophion.bootstrap.bin'
+$sealPath = Join-Path $outDir 'ophion.seal.bin'
 $stopPath = Join-Path $outDir 'ophion.stop.bin'
 $cleanupPath = Join-Path $outDir 'ophion.cleanup.bin'
 $manifestText = Get-Content -LiteralPath $jsonPath -Raw
@@ -146,6 +147,7 @@ $manifest = $manifestText | ConvertFrom-Json
 $image = [IO.File]::ReadAllBytes($mapPath)
 $thunk = [IO.File]::ReadAllBytes($thunkPath)
 $bootstrapThunk = [IO.File]::ReadAllBytes($bootstrapPath)
+$sealThunk = [IO.File]::ReadAllBytes($sealPath)
 $stopThunk = [IO.File]::ReadAllBytes($stopPath)
 $cleanupThunk = [IO.File]::ReadAllBytes($cleanupPath)
 
@@ -177,6 +179,11 @@ if ($manifest.schema -ne 'ophion.map.v2' -or
     $manifest.bootstrapCapabilityLowOffset -ne 39 -or
     $manifest.bootstrapCapabilityHighOffset -ne 49 -or
     $manifest.bootstrapEpochOffset -ne 59 -or
+    $manifest.sealThunk -ne 'ophion.seal.bin' -or
+    $manifest.sealThunkSize -ne $sealThunk.Length -or
+    $manifest.sealCapabilityLowOffset -ne 39 -or
+    $manifest.sealCapabilityHighOffset -ne 49 -or
+    $manifest.sealEpochOffset -ne 59 -or
     -not $manifest.importsResolved) {
     throw 'Mapper transport manifest invariant failed.'
 }
@@ -239,6 +246,22 @@ if ($bootstrapThunk.Length -ne 73 -or
         $bootstrapThunk, $manifest.bootstrapEpochOffset) -ne 0) {
     throw 'VMX-root bootstrap thunk ABI changed.'
 }
+if ($sealThunk.Length -ne 73 -or
+    [BitConverter]::ToUInt64($sealThunk, 4) -ne
+        [Convert]::ToUInt64('48564653', 16) -or
+    [BitConverter]::ToUInt64($sealThunk, 14) -ne
+        [Convert]::ToUInt64('564D43414C4C', 16) -or
+    [BitConverter]::ToUInt64($sealThunk, 24) -ne
+        [Convert]::ToUInt64('4E4F485950455256', 16) -or
+    [BitConverter]::ToUInt32($sealThunk, 33) -ne 5 -or
+    [BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealCapabilityLowOffset) -ne 0 -or
+    [BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealCapabilityHighOffset) -ne 0 -or
+    [BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealEpochOffset) -ne 0) {
+    throw 'VMX-root all-core seal thunk ABI changed.'
+}
 
 $shared = [int]$manifest.sharedPageRva
 for ($i = 0; $i -lt 4096; $i++) {
@@ -274,6 +297,12 @@ $capHigh = [Convert]::ToUInt64('FEDCBA9876543210', 16)
     $bootstrapThunk, $manifest.bootstrapCapabilityHighOffset)
 [BitConverter]::GetBytes([UInt64]1).CopyTo(
     $bootstrapThunk, $manifest.bootstrapEpochOffset)
+[BitConverter]::GetBytes($capLow).CopyTo(
+    $sealThunk, $manifest.sealCapabilityLowOffset)
+[BitConverter]::GetBytes($capHigh).CopyTo(
+    $sealThunk, $manifest.sealCapabilityHighOffset)
+[BitConverter]::GetBytes([UInt64]1).CopyTo(
+    $sealThunk, $manifest.sealEpochOffset)
 
 if ([BitConverter]::ToUInt64($image, $shared) -ne
         [UInt64]0x7A6D94C13B52E807 -or
@@ -300,11 +329,19 @@ if ([BitConverter]::ToUInt64(
         $bootstrapThunk, $manifest.bootstrapEpochOffset) -ne 1) {
     throw 'Runtime bootstrap-thunk patch does not match manifest offsets.'
 }
+if ([BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealCapabilityLowOffset) -ne $capLow -or
+    [BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealCapabilityHighOffset) -ne $capHigh -or
+    [BitConverter]::ToUInt64(
+        $sealThunk, $manifest.sealEpochOffset) -ne 1) {
+    throw 'Runtime seal-thunk patch does not match manifest offsets.'
+}
 if ($manifestText -match '0123456789abcdef|fedcba9876543210') {
     throw 'Capability material leaked into mapper metadata.'
 }
 
 Write-Host (
-    'Mapper artifact tests passed: image={0} entry={1} bootstrap={2} stop={3} cleanup={4} sharedRva=0x{5:X}' -f
+    'Mapper artifact tests passed: image={0} entry={1} bootstrap={2} seal={3} stop={4} cleanup={5} sharedRva=0x{6:X}' -f
     $image.Length, $thunk.Length, $bootstrapThunk.Length,
-    $stopThunk.Length, $cleanupThunk.Length, $shared)
+    $sealThunk.Length, $stopThunk.Length, $cleanupThunk.Length, $shared)

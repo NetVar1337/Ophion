@@ -29,14 +29,16 @@ static UINT64  g_host_pml4_pa  = 0;
 static PVOID
 host_alloc_page(VOID)
 {
+    if (g_host_pt_count >= MAX_HOST_PT_PAGES)
+        return NULL;
+
     PVOID page = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
     if (!page)
         return NULL;
 
     RtlZeroMemory(page, PAGE_SIZE);
 
-    if (g_host_pt_count < MAX_HOST_PT_PAGES)
-        g_host_pt_pages[g_host_pt_count++] = page;
+    g_host_pt_pages[g_host_pt_count++] = page;
 
     return page;
 }
@@ -97,17 +99,11 @@ host_clone_pd(PUINT64 orig_pd)
         UINT64  orig_pt_pa = orig_pd[k] & PTE_PFN_MASK;
         PUINT64 orig_pt    = host_map_phys(orig_pt_pa);
         if (!orig_pt)
-        {
-            our_pd[k] = orig_pd[k];
-            continue;
-        }
+            return NULL;
 
         PUINT64 our_pt = host_clone_pt(orig_pt);
         if (!our_pt)
-        {
-            our_pd[k] = orig_pd[k];
-            continue;
-        }
+            return NULL;
 
         our_pd[k] = (orig_pd[k] & ~PTE_PFN_MASK) | va_to_pa(our_pt);
     }
@@ -143,17 +139,11 @@ host_clone_pdpt(PUINT64 orig_pdpt)
         UINT64  orig_pd_pa = orig_pdpt[j] & PTE_PFN_MASK;
         PUINT64 orig_pd    = host_map_phys(orig_pd_pa);
         if (!orig_pd)
-        {
-            our_pdpt[j] = orig_pdpt[j];
-            continue;
-        }
+            return NULL;
 
         PUINT64 our_pd = host_clone_pd(orig_pd);
         if (!our_pd)
-        {
-            our_pdpt[j] = orig_pdpt[j];
-            continue;
-        }
+            return NULL;
 
         our_pdpt[j] = (orig_pdpt[j] & ~PTE_PFN_MASK) | va_to_pa(our_pd);
     }
@@ -210,17 +200,11 @@ hostcr3_build(VOID)
         UINT64  orig_pdpt_pa = orig_pml4[i] & PTE_PFN_MASK;
         PUINT64 orig_pdpt    = host_map_phys(orig_pdpt_pa);
         if (!orig_pdpt)
-        {
-            our_pml4[i] = orig_pml4[i];
-            continue;
-        }
+            return FALSE;
 
         PUINT64 our_pdpt = host_clone_pdpt(orig_pdpt);
         if (!our_pdpt)
-        {
-            our_pml4[i] = orig_pml4[i];
-            continue;
-        }
+            return FALSE;
 
         our_pml4[i] = (orig_pml4[i] & ~PTE_PFN_MASK) | va_to_pa(our_pdpt);
     }

@@ -551,6 +551,11 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             break;
 
         case IA32_X2APIC_CUR_COUNT:
+        {
+            UINT64 apic_base = __readmsr(IA32_APIC_BASE);
+            vcpu->x2apic_enabled =
+                (apic_base & IA32_APIC_BASE_ENABLE) != 0 &&
+                (apic_base & IA32_APIC_BASE_X2APIC) != 0;
             if (vcpu->x2apic_enabled)
             {
                 UINT32 raw = (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
@@ -563,7 +568,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
                     vcpu->lapic_root_bias = 0;
                 }
                 adjusted = raw;
-                if (vcpu->timer_bias_pending)
+                if (raw && vcpu->timer_bias_pending)
                 {
                     adjusted += vcpu->lapic_root_bias;
                     if (vcpu->lapic_root_entry >= raw)
@@ -576,6 +581,7 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             vmexit_inject_gp();
             vcpu->advance_rip = FALSE;
             return;
+        }
 
         default:
             //
@@ -1085,7 +1091,6 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
     if (vmcall_num != VMCALL_BOOTSTRAP_STEP &&
         vmcall_num != VMCALL_SEAL_STEP &&
         vmcall_num != VMCALL_STOP_STEP &&
-        vmcall_num != VMCALL_CONCEAL_COMMIT &&
         vmcall_num != VMCALL_INIT_ROLLBACK &&
         vmcall_num != VMCALL_ROOT_COMMAND &&
         !root_transport_legacy_allowed(vmcall_num))
@@ -1405,10 +1410,9 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
 }
 
 //
-// per-exit state sampling plan: only the state a given exit reason actually
-// consumes is read from hardware. unconditional DR/CR8/PMU/LAPIC reads on
-// every exit inflated VM-exit cost, which instruction-execution-timing probes
-// (CPUID vs non-exiting instruction) measure directly.
+// Per-exit state sampling plan. APERF/MPERF must bracket every exit because
+// both counters advance during any root-mode residency. DR, CR8, and LAPIC
+// state remain conditional so unrelated exits do not pay for unused reads.
 //
 #define VMEXIT_SAMPLE_APERF_MPERF   0x1u
 #define VMEXIT_SAMPLE_LAPIC         0x2u
@@ -1418,11 +1422,13 @@ vmexit_handle_mov_dr(VIRTUAL_MACHINE_STATE * vcpu)
 static __forceinline UINT32
 vmexit_exit_sample_plan(UINT32 exit_reason)
 {
+    UINT32 plan = VMEXIT_SAMPLE_APERF_MPERF;
+
     switch (exit_reason)
     {
     case VMX_EXIT_REASON_EXECUTE_RDMSR:
     case VMX_EXIT_REASON_EXECUTE_WRMSR:
-        return VMEXIT_SAMPLE_APERF_MPERF | VMEXIT_SAMPLE_LAPIC;
+        return plan | VMEXIT_SAMPLE_LAPIC;
 
     case VMX_EXIT_REASON_EXECUTE_CPUID:
     case VMX_EXIT_REASON_EXECUTE_RDTSC:
@@ -1430,18 +1436,18 @@ vmexit_exit_sample_plan(UINT32 exit_reason)
     case VMX_EXIT_REASON_EXECUTE_RDPMC:
     case VMX_EXIT_REASON_EPT_VIOLATION:
     case VMX_EXIT_REASON_MONITOR_TRAP_FLAG:
-        return VMEXIT_SAMPLE_APERF_MPERF | VMEXIT_SAMPLE_LAPIC;
+        return plan | VMEXIT_SAMPLE_LAPIC;
 
     case VMX_EXIT_REASON_MOV_DR:
-        return VMEXIT_SAMPLE_DR;
+        return plan | VMEXIT_SAMPLE_DR;
 
     case VMX_EXIT_REASON_EXTERNAL_INTERRUPT:
     case VMX_EXIT_REASON_INTERRUPT_WINDOW:
     case VMX_EXIT_REASON_MOV_CR:
-        return VMEXIT_SAMPLE_CR8;
+        return plan | VMEXIT_SAMPLE_CR8;
 
     default:
-        return 0;
+        return plan;
     }
 }
 
@@ -1513,13 +1519,37 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     }
     if (sample_plan & VMEXIT_SAMPLE_LAPIC)
     {
-        if (vcpu->x2apic_enabled)
+        UINT64 apic_base = __readmsr(IA32_APIC_BASE);
+        BOOLEAN apic_enabled =
+            (apic_base & IA32_APIC_BASE_ENABLE) != 0;
+
+        vcpu->x2apic_enabled =
+            apic_enabled &&
+            (apic_base & IA32_APIC_BASE_X2APIC) != 0;
+        if (!apic_enabled)
+        {
+            sample_plan &= ~VMEXIT_SAMPLE_LAPIC;
+        }
+        else if (vcpu->x2apic_enabled)
+        {
             vcpu->lapic_root_entry =
                 (UINT32)__readmsr(IA32_X2APIC_CUR_COUNT);
-        else if (vcpu->lapic_va)
+        }
+        else if (vcpu->lapic_va &&
+                 vcpu->lapic_hook.physical_page ==
+                     (apic_base & IA32_APIC_BASE_ADDRESS_MASK))
+        {
             vcpu->lapic_root_entry =
                 *(volatile UINT32 *)((PUCHAR)vcpu->lapic_va +
                                      XAPIC_CURRENT_COUNT_OFFSET);
+        }
+        else
+        {
+            vmexit_enter_terminal(
+                vcpu, HV_FAILURE_REQUIRED_CONTROLS);
+            vcpu->in_root = FALSE;
+            return FALSE;
+        }
     }
     if (sample_plan & VMEXIT_SAMPLE_CR8)
         vcpu->guest_cr8 = (UINT8)__readcr8();

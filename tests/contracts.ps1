@@ -332,6 +332,7 @@ Assert ($mapSource -match 'none-sc-none-ntloaddriver' -and
         $mapSource -match 'buildEntryThunk' -and
         $mapSource -match 'ophion\.exec\.bin' -and
         $mapSource -match 'ophion\.bootstrap\.bin' -and
+        $mapSource -match 'ophion\.seal\.bin' -and
         $mapSource -match 'findSharedPageRva' -and
         $mapSource -match 'commandMagic' -and
         $mapSource -match '\-\-mac-self-test' -and
@@ -366,6 +367,23 @@ Assert ($rootTransport -match 'root_transport_bootstrap' -and
         $rootTransport -match 'ConcealReady' -and
         $rootTransport -notmatch 'root_transport_get_bootstrap_auth' -and
         $rootTransport -match '(?s)root_transport_bootstrap.*CapabilityLow.*CapabilityHigh.*RtlSecureZeroMemory') 'capability must be established and erased in VMX root'
+$bootstrapBody = [regex]::Match(
+    $rootTransport,
+    '(?s)NTSTATUS\s+root_transport_bootstrap\s*\(.*?\)\s*\{(?<body>.*?)\n\}')
+Assert ($bootstrapBody.Success -and
+        $bootstrapBody.Groups['body'].Value -notmatch 'ConcealReady') 'external bootstrap must complete before all-core concealment seals the image'
+$sealStep = [regex]::Match(
+    $rootTransport,
+    '(?s)NTSTATUS\s+root_transport_seal_step\s*\(.*?\)\s*\{(?<body>.*?)\n\}')
+Assert ($sealStep.Success -and
+        $sealStep.Groups['body'].Value -match 'ept_conceal_commit_local' -and
+        $sealStep.Groups['body'].Value -match 'root_transport_conceal_ack' -and
+        $sealStep.Groups['body'].Value.IndexOf('root_transport_authorized') -lt
+            $sealStep.Groups['body'].Value.IndexOf('ept_conceal_commit_local') -and
+        $sealStep.Groups['body'].Value.IndexOf('ept_conceal_commit_local') -lt
+            $sealStep.Groups['body'].Value.IndexOf('SealedBitmap')) 'authenticated all-core seal must commit concealment before publishing the local sealed bit'
+$vmxConcealFlow = Get-Content -LiteralPath (Join-Path $repo 'src\vmx.c') -Raw
+Assert ($vmxConcealFlow -match '(?s)#if\s*!OPHION_PRODUCTION.*broadcast_conceal_invept\(\).*?#endif') 'production must not conceal the return path from an in-image DPC'
 Assert ($rootTransport -match 'root_transport_stop_begin' -and
         $rootTransport -match 'root_transport_stop_complete' -and
         $rootTransport -match 'StoppedBitmap' -and
@@ -477,6 +495,7 @@ Assert ($readme -match 'DirectIo64_legacy' -and $readme -match 'OphionLoad.exe')
 
 $protect = Get-Content -LiteralPath (Join-Path $repo 'src\protect.c') -Raw
 $vmxSource = Get-Content -LiteralPath (Join-Path $repo 'src\vmx.c') -Raw
+$hostCr3 = Get-Content -LiteralPath (Join-Path $repo 'src\hostcr3.c') -Raw
 $broadcast = Get-Content -LiteralPath (Join-Path $repo 'src\broadcast.c') -Raw
 $byovdConceal = Get-Content -LiteralPath (Join-Path $repo 'src\byovd_conceal.c') -Raw
 $eacStealth = Get-Content -LiteralPath (Join-Path $repo 'src\eac_stealth.c') -Raw
@@ -535,6 +554,78 @@ Assert ($vmexit -match 'regs->rax\s*=\s*\(UINT64\)\(UINT32\)cpu_info\[0\]' -and
         $vmexit -match 'regs->rcx\s*=\s*\(UINT64\)\(UINT32\)cpu_info\[2\]' -and
         $vmexit -match 'regs->rdx\s*=\s*\(UINT64\)\(UINT32\)cpu_info\[3\]') 'CPUID results must zero-extend into 64-bit guest registers'
 Assert ($bootVmxCore -notmatch 'EXECCTRL_CPUID_EXIT') 'CPUID is an unconditional VM exit; primary control bit 21 must not be requested as CPUID exiting'
+$movCr4 = [regex]::Match(
+    $vmexit,
+    '(?s)case\s+4:\s*\{(?<body>.*?MOV to CR4.*?)\n\s*break;')
+Assert ($movCr4.Success -and
+        $movCr4.Groups['body'].Value -match 'actual\s*=\s*desired\s*\|\s*CR4_VMX_ENABLE_FLAG' -and
+        $movCr4.Groups['body'].Value -match 'VMCS_CTRL_CR4_READ_SHADOW,\s*desired' -and
+        $movCr4.Groups['body'].Value -notmatch 'VMCS_CTRL_CR4_READ_SHADOW,\s*desired\s*&\s*~CR4_VMX_ENABLE_FLAG') 'CR4.VMXE writes must update the read shadow while the actual guest CR4 keeps VMXE set'
+Assert ($vmxSource -match 'VMCS_CTRL_CR4_READ_SHADOW,\s*__readcr4\(\)\s*&\s*~CR4_VMX_ENABLE_FLAG') 'initial CR4 shadow must hide host VMXE before any guest write'
+Assert ($stealthHeader -match '#define\s+STEALTH_VIRTUALIZE_PMU\s+1' -and
+        $vmxSource -match 'VM_EXIT_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL' -and
+        $vmxSource -match 'VM_EXIT_CTRL_SAVE_IA32_PERF_GLOBAL_CTRL' -and
+        $vmxSource -match 'VM_ENTRY_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL' -and
+        $vmexit -match 'aperf_root_bias' -and
+        $vmexit -match 'mperf_root_bias') 'PMU isolation and APERF/MPERF compensation contract drifted'
+$pmuIsolation = [regex]::Match(
+    $vmxSource,
+    '(?s)vcpu->pmu_isolated\s*=(?<body>.*?);')
+Assert ($pmuIsolation.Success -and
+        $pmuIsolation.Groups['body'].Value -match 'VM_EXIT_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL' -and
+        $pmuIsolation.Groups['body'].Value -match 'VM_ENTRY_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL' -and
+        $vmexit -match '(?s)case\s+IA32_PERF_GLOBAL_CTRL:.*vcpu->perf_global_ctrl\s*=\s*msr.Flags.*VMCS_GUEST_PERF_GLOBAL_CTRL') 'PMU isolation requires host/guest load controls and an intercepted guest control shadow'
+Assert ($vmxSource -match '(?s)vcpu->pmu_version\s*&&\s*!vcpu->pmu_isolated.*HV_FAILURE_REQUIRED_CONTROLS.*return\s+FALSE') 'advertised PMU must fail closed when VMCS PERF_GLOBAL_CTRL isolation is unavailable'
+$samplePlan = [regex]::Match(
+    $vmexit,
+    '(?s)vmexit_exit_sample_plan\s*\([^)]*\)\s*\{(?<body>.*?)\n\}')
+Assert ($samplePlan.Success -and
+        $samplePlan.Groups['body'].Value -match 'plan\s*=\s*VMEXIT_SAMPLE_APERF_MPERF' -and
+        $samplePlan.Groups['body'].Value -notmatch 'default:\s*return\s+0') 'APERF/MPERF root residency must be sampled for every VM-exit reason'
+Assert ($stealthHeader -match '#define\s+STEALTH_VIRTUALIZE_TIMERS\s+1' -and
+        $ept -match 'ept_create_mmio_hook' -and
+        $ept -match 'EptMmioHpet' -and
+        $ept -match 'EptMmioLapic' -and
+        $ept -match 'ept_handle_mmio_violation' -and
+        $ept -match 'CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG') 'HPET/xAPIC EPT timer virtualization contract drifted'
+$timerViolation = [regex]::Match(
+    $ept,
+    '(?s)BOOLEAN\s+ept_handle_mmio_violation\s*\(.*?\)\s*\{(?<body>.*?)\n\}')
+Assert ($timerViolation.Success -and
+        $timerViolation.Groups['body'].Value -match 'qual\.ExecuteAccess\s*\|\|' -and
+        $timerViolation.Groups['body'].Value -match 'qual\.ReadAccess\s*&&\s*qual\.WriteAccess' -and
+        $timerViolation.Groups['body'].Value -match 'return\s+FALSE') 'timer hooks must reject execute and mixed RMW accesses instead of livelocking or exposing the real counter'
+$timerSetup = [regex]::Match(
+    $ept,
+    '(?s)ept_setup_timer_hooks\s*\([^)]*\)\s*\{(?<body>.*?)\n\}')
+Assert ($timerSetup.Success -and
+        $timerSetup.Groups['body'].Value -notmatch 'continuing without MMIO timing hooks' -and
+        $timerSetup.Groups['body'].Value -match '(?s)hpet_physical\s*&&\s*!g_ept->tsc_frequency.*return\s+FALSE' -and
+        $timerSetup.Groups['body'].Value -match '(?s)!g_ept->mtf_supported.*return\s+FALSE' -and
+        $timerSetup.Groups['body'].Value -match '(?s)!vcpu->hpet_va.*ept_destroy_timer_hooks\(\);\s*return\s+FALSE' -and
+        $timerSetup.Groups['body'].Value -match '(?s)!vcpu->lapic_va.*ept_destroy_timer_hooks\(\);\s*return\s+FALSE') 'enabled timer virtualization must fail closed when required EPT/MTF hooks cannot be installed'
+$tscFrequency = [regex]::Match(
+    $ept,
+    '(?s)ept_query_tsc_frequency\s*\([^)]*\)\s*\{(?<body>.*?)\n\}')
+Assert ($tscFrequency.Success -and
+        $tscFrequency.Groups['body'].Value -match '0x15' -and
+        $tscFrequency.Groups['body'].Value -notmatch '0x16') 'HPET conversion must use an architectural TSC-frequency source, not CPUID.16H base frequency'
+Assert ($timerSetup.Groups['body'].Value -match 'if\s*\(\s*apic_enabled\s*\)' -and
+        $timerSetup.Groups['body'].Value -notmatch 'if\s*\(\s*apic_enabled\s*&&\s*!x2apic\s*\)' -and
+        $vmexit -match '(?s)case\s+IA32_X2APIC_CUR_COUNT:.*__readmsr\(IA32_APIC_BASE\).*x2apic_enabled') 'LAPIC hook state must survive xAPIC/x2APIC mode transitions after launch'
+$lapicSample = [regex]::Match(
+    $vmexit,
+    '(?s)if\s*\(\s*sample_plan\s*&\s*VMEXIT_SAMPLE_LAPIC\s*\)\s*\{(?<body>.*?)\n\s*\}')
+Assert ($lapicSample.Success -and
+        $lapicSample.Groups['body'].Value -match '__readmsr\(IA32_APIC_BASE\)' -and
+        $lapicSample.Groups['body'].Value -match 'x2apic_enabled') 'per-exit LAPIC sampling must refresh APIC mode before touching the x2APIC current-count MSR'
+Assert ($ept -match 'if\s*\(\s*raw\s*&&\s*vcpu->timer_bias_pending\s*\)' -and
+        $vmexit -match '(?s)case\s+IA32_X2APIC_CUR_COUNT:.*if\s*\(\s*raw\s*&&\s*vcpu->timer_bias_pending\s*\)') 'expired one-shot LAPIC timers must remain visibly expired after compensation'
+Assert ($stealthHeader -match '#define\s+USE_PRIVATE_HOST_CR3\s+0') 'private host CR3 must remain disabled until a race-safe live refresh protocol exists'
+Assert ($hostCr3 -match '(?s)if\s*\(!orig_pt\)\s*return\s+NULL;.*if\s*\(!our_pt\)\s*return\s+NULL;' -and
+        $hostCr3 -match '(?s)if\s*\(!orig_pd\)\s*return\s+NULL;.*if\s*\(!our_pd\)\s*return\s+NULL;' -and
+        $hostCr3 -match '(?s)if\s*\(!orig_pdpt\)\s*return\s+FALSE;.*if\s*\(!our_pdpt\)\s*return\s+FALSE;' -and
+        $hostCr3 -match 'g_host_pt_count\s*>=\s*MAX_HOST_PT_PAGES') 'private host CR3 cloning must fail instead of sharing guest-modifiable page-table branches'
 function Sync-DynamicControls(
     [uint64]$Controls,
     [uint64]$Forced,

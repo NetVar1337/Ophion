@@ -53,13 +53,6 @@ ept_query_tsc_frequency(VOID)
         frequency = ((UINT64)(UINT32)cpu_info[2] * (UINT32)cpu_info[1]) /
                     (UINT32)cpu_info[0];
 
-    if (!frequency)
-    {
-        __cpuidex(cpu_info, 0x16, 0);
-        if (cpu_info[0])
-            frequency = (UINT64)(UINT32)cpu_info[0] * 1000000ULL;
-    }
-
     return frequency;
 }
 
@@ -719,11 +712,19 @@ ept_setup_timer_hooks(VOID)
     for (UINT32 i = 0; i < g_cpu_count; i++)
         g_vcpu[i].x2apic_enabled = apic_enabled && x2apic;
 
-    if (!g_ept->mtf_supported)
+    if (g_ept->hpet_physical && !g_ept->tsc_frequency)
     {
         HV_LOG(0, 0,
-            "[hv] Timer MMIO virtualization disabled: MTF unavailable\n");
-        return TRUE;
+            "[hv] HPET virtualization failed: TSC frequency unavailable\n");
+        return FALSE;
+    }
+
+    if ((g_ept->hpet_physical || apic_enabled) &&
+        !g_ept->mtf_supported)
+    {
+        HV_LOG(0, 0,
+            "[hv] Timer MMIO virtualization failed: MTF unavailable\n");
+        return FALSE;
     }
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -747,13 +748,13 @@ ept_setup_timer_hooks(VOID)
                         ? sizeof(UINT64) : sizeof(UINT32)))
             {
                 HV_LOG(0, 0,
-                    "[hv] HPET virtualization unavailable; continuing without MMIO timing hooks\n");
+                    "[hv] HPET virtualization failed\n");
                 ept_destroy_timer_hooks();
-                return TRUE;
+                return FALSE;
             }
         }
 
-        if (apic_enabled && !x2apic)
+        if (apic_enabled)
         {
             PHYSICAL_ADDRESS pa;
             pa.QuadPart = apic_physical;
@@ -765,9 +766,9 @@ ept_setup_timer_hooks(VOID)
                     apic_physical, XAPIC_CURRENT_COUNT_OFFSET, sizeof(UINT32)))
             {
                 HV_LOG(0, 0,
-                    "[hv] xAPIC virtualization unavailable; continuing without MMIO timing hooks\n");
+                    "[hv] xAPIC virtualization failed\n");
                 ept_destroy_timer_hooks();
-                return TRUE;
+                return FALSE;
             }
             g_hv_capabilities.CapabilityFlags |= HV_CAP_XAPIC;
         }
@@ -794,9 +795,11 @@ ept_handle_mmio_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys)
         return FALSE;
 
     qual.AsUInt = vcpu->exit_qual;
+    if (qual.ExecuteAccess ||
+        (qual.ReadAccess && qual.WriteAccess))
+        return FALSE;
     target_read = qual.ReadAccess &&
         !qual.WriteAccess &&
-        !qual.ExecuteAccess &&
         offset == hook->target_offset;
 
     hook->entry->AsUInt = hook->original_entry;
@@ -864,7 +867,7 @@ ept_handle_mmio_violation(VIRTUAL_MACHINE_STATE * vcpu, UINT64 guest_phys)
                 vcpu->lapic_root_bias = 0;
             }
             adjusted = raw;
-            if (vcpu->timer_bias_pending)
+            if (raw && vcpu->timer_bias_pending)
             {
                 adjusted += vcpu->lapic_root_bias;
                 if (vcpu->lapic_root_entry >= raw)

@@ -72,7 +72,8 @@
 //
 // use private (deep-copied) host page tables for VMCS_HOST_CR3
 // protects host-mode from guest/anti-cheat page table corruption
-// disabled by default — enable once base hv is verified stable
+// disabled until a preallocated two-generation snapshot, authenticated
+// all-core switch, and post-switch observation/reclamation protocol exist
 //
 #define USE_PRIVATE_HOST_CR3                0
 

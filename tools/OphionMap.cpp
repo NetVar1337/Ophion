@@ -294,6 +294,11 @@ std::vector<std::uint8_t> buildBootstrapThunk() {
         HV_ROOT_VMCALL_BOOTSTRAP_STEP);
 }
 
+std::vector<std::uint8_t> buildSealThunk() {
+    return buildAuthenticatedVmcallThunk(
+        HV_ROOT_VMCALL_SEAL_STEP);
+}
+
 bool runMacSelfTest() {
     constexpr std::uint64_t keyLow = 0x0706050403020100ULL;
     constexpr std::uint64_t keyHigh = 0x0F0E0D0C0B0A0908ULL;
@@ -371,7 +376,8 @@ void usage() {
         "                    --ntos-base <hex>\n"
         "       OphionMap.exe --mac-self-test\n"
         "emits ophion.map.bin, ophion.exec.bin, ophion.bootstrap.bin,\n"
-        "      ophion.stop.bin, ophion.cleanup.bin, and ophion.map.json\n"
+        "      ophion.seal.bin, ophion.stop.bin, ophion.cleanup.bin,\n"
+        "      and ophion.map.json\n"
         "copy the image and thunk with an external kernel write/execute primitive\n",
         stderr);
 }
@@ -538,6 +544,7 @@ int main(int argc, char** argv) {
         auto cleanupVa = base + cleanupRva;
         auto entryThunk = buildEntryThunk(entryVa);
         auto bootstrapThunk = buildBootstrapThunk();
+        auto sealThunk = buildSealThunk();
         auto cleanupThunk = buildEntryThunk(cleanupVa);
         auto stopThunk = buildStopThunk();
 
@@ -545,6 +552,7 @@ int main(int argc, char** argv) {
         auto binPath = outDir + "\\ophion.map.bin";
         auto thunkPath = outDir + "\\ophion.exec.bin";
         auto bootstrapPath = outDir + "\\ophion.bootstrap.bin";
+        auto sealPath = outDir + "\\ophion.seal.bin";
         auto stopPath = outDir + "\\ophion.stop.bin";
         auto cleanupPath = outDir + "\\ophion.cleanup.bin";
         auto jsonPath = outDir + "\\ophion.map.json";
@@ -554,6 +562,7 @@ int main(int argc, char** argv) {
             bootstrapPath,
             bootstrapThunk.data(),
             bootstrapThunk.size());
+        writeFile(sealPath, sealThunk.data(), sealThunk.size());
         writeFile(stopPath, stopThunk.data(), stopThunk.size());
         writeFile(cleanupPath, cleanupThunk.data(), cleanupThunk.size());
 
@@ -580,6 +589,13 @@ int main(int argc, char** argv) {
         json << "  \"bootstrapCapabilityHighOffset\": "
              << kStopCapabilityHighOffset << ",\n";
         json << "  \"bootstrapEpochOffset\": " << kStopEpochOffset << ",\n";
+        json << "  \"sealThunk\": \"ophion.seal.bin\",\n";
+        json << "  \"sealThunkSize\": " << sealThunk.size() << ",\n";
+        json << "  \"sealCapabilityLowOffset\": "
+             << kStopCapabilityLowOffset << ",\n";
+        json << "  \"sealCapabilityHighOffset\": "
+             << kStopCapabilityHighOffset << ",\n";
+        json << "  \"sealEpochOffset\": " << kStopEpochOffset << ",\n";
         json << "  \"stopThunk\": \"ophion.stop.bin\",\n";
         json << "  \"stopThunkSize\": " << stopThunk.size() << ",\n";
         json << "  \"stopCapabilityLowOffset\": "
@@ -624,10 +640,11 @@ int main(int argc, char** argv) {
         json << "}\n";
         std::printf(
                     "wrote %s (%zu), %s (%zu), %s (%zu), %s (%zu), "
-                    "%s (%zu), and %s\n",
+                    "%s (%zu), %s (%zu), and %s\n",
                     binPath.c_str(), image.size(), thunkPath.c_str(),
                     entryThunk.size(), bootstrapPath.c_str(),
-                    bootstrapThunk.size(), stopPath.c_str(), stopThunk.size(),
+                    bootstrapThunk.size(), sealPath.c_str(), sealThunk.size(),
+                    stopPath.c_str(), stopThunk.size(),
                     cleanupPath.c_str(), cleanupThunk.size(),
                     jsonPath.c_str());
         return 0;

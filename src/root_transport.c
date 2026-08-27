@@ -292,8 +292,10 @@ root_transport_conceal_ack(
     LONG64 previous;
     LONG count;
 
-    if (root_transport_phase() !=
-            HV_ROOT_PHASE_AWAITING_BOOTSTRAP ||
+    if ((root_transport_phase() !=
+            HV_ROOT_PHASE_AWAITING_BOOTSTRAP &&
+         root_transport_phase() !=
+            HV_ROOT_PHASE_PREPARED) ||
         !root_transport_vcpu_index(vcpu, &index))
         return FALSE;
 
@@ -331,8 +333,6 @@ root_transport_bootstrap(
     if (!vcpu || !vcpu->launched ||
         (!capability_low && !capability_high) ||
         !epoch ||
-        InterlockedCompareExchange(
-            &state->ConcealReady, 0, 0) == 0 ||
         root_transport_phase() !=
             HV_ROOT_PHASE_AWAITING_BOOTSTRAP)
         return STATUS_DEVICE_NOT_READY;
@@ -759,6 +759,21 @@ root_transport_seal_step(
 
     if (!root_transport_vcpu_index(vcpu, &index))
         return STATUS_INVALID_PARAMETER;
+    if (phase == HV_ROOT_PHASE_ACTIVE)
+        return STATUS_SUCCESS;
+
+    /*
+     * Commit self-concealment from the external all-core seal thunk, after
+     * DriverEntry and vmx_init returned outside the mapped image.  An in-image
+     * DPC would make its own post-VMCALL return path non-executable.
+     */
+    if (!ept_conceal_commit_local(vcpu) ||
+        !root_transport_conceal_ack(vcpu))
+    {
+        root_transport_mark_failed(
+            HV_FAILURE_EPT_MISCONFIGURATION);
+        return STATUS_HV_OPERATION_FAILED;
+    }
 
     word = index / 64;
     mask = (LONG64)(1ULL << (index % 64));
@@ -766,7 +781,9 @@ root_transport_seal_step(
     if (!(previous & mask))
     {
         sealed = InterlockedIncrement(&state->SealedCount);
-        if ((UINT32)sealed == state->ProcessorCount)
+        if ((UINT32)sealed == state->ProcessorCount &&
+            InterlockedCompareExchange(
+                &state->ConcealReady, 0, 0) != 0)
             InterlockedExchange(&state->Phase, HV_ROOT_PHASE_ACTIVE);
     }
 

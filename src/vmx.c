@@ -595,6 +595,13 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
         __vmx_vmwrite(VMCS_GUEST_PERF_GLOBAL_CTRL, vcpu->perf_global_ctrl);
         __vmx_vmwrite(VMCS_HOST_PERF_GLOBAL_CTRL, 0);
     }
+#if STEALTH_VIRTUALIZE_PMU
+    if (vcpu->pmu_version && !vcpu->pmu_isolated)
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_REQUIRED_CONTROLS;
+        return FALSE;
+    }
+#endif
 
     //
     // CR0: 0 = don't cause VM-exit on CR0 modifications (pass-through)
@@ -1039,6 +1046,7 @@ vmx_init(VOID)
         return FALSE;
     }
 #if STEALTH_CONCEAL_HOST_PAGES
+#if !OPHION_PRODUCTION
     if (g_stealth_enabled)
     {
         if (!broadcast_conceal_invept())
@@ -1048,6 +1056,7 @@ vmx_init(VOID)
             return FALSE;
         }
     }
+#endif
 
     eac_stealth_apply();
 #endif
