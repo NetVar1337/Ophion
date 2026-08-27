@@ -3,6 +3,12 @@
 
 Intel VT-x Type-2 hypervisor research code for virtualizing an already running Windows system. The feature list below describes implemented code paths; detector compatibility and production stability are not implied. Current evidence is tracked explicitly in the evidence matrix.
 
+> **Build boundary:** Visual Studio `Debug` and `Release` configurations are
+> diagnostic artifacts. The only production driver path is
+> `.\build.ps1 -Configuration Release -Production -WarningsAsErrors`, which
+> uses an explicit source profile and runs the post-link production-boundary
+> verifier.
+
 
 ***
 
@@ -17,6 +23,7 @@ Intel VT-x Type-2 hypervisor research code for virtualizing an already running W
 ## Features
 
 - **Per-core VMX** — Virtualizes all logical processors via DPC broadcast. Clean VMXOFF on unload with guest CR3 restoration.
+- **Host-page concealment** — Before launch, host-owned GPAs (VMXON, VMCS, EPT tables, bitmaps, stacks, GDT, root state, and the dummy identity page) are frozen into an immutable manifest. Each vCPU atomically retargets its own EPT leaves to the read-only/execute-clear dummy page in VMX root and executes INVEPT before acknowledging. The mapped driver image remains guest-visible.
 - **EPT with 2MB large pages** — Identity-mapped, MTRR-aware memory typing (fixed + variable ranges). Per-processor page tables with dynamic 2MB-to-4KB splitting for hooks.
 - **VPID** — Capability-aware INVVPID (prefers type 3 retaining-globals, falls back gracefully).
 - **System host CR3** — Uses a build-independent system-process CR3 by default. The stale private page-table snapshot path is retained but disabled.
@@ -24,9 +31,7 @@ Intel VT-x Type-2 hypervisor research code for virtualizing an already running W
 - **Private host GDT** — Per-core isolated GDT for VMX-root mode. Each core has its own TSS, so the private GDT is per-VCPU. On VMXOFF, clears TSS busy bit and reloads original GDTR/TR.
 - **CPUID coherence** — Caches bare-metal CPUID at init, hides ECX[31] and invalid hypervisor leaves only on bare metal, and preserves an existing parent-hypervisor persona when running nested.
 - **CR4.VMXE coherence** — VMXE is hidden initially, but guest writes update the read shadow exactly as bare metal does. A guest VMXON triggers a clean per-vCPU handoff so VMware can acquire VMX without a #UD/crash.
-- **TSC compensation** — One-shot CPUID/RDTSC compensation preserves native CPUID cost without persistent per-core TSC offsets; the same pending bias is mirrored into HPET/LAPIC reads.
-- **PMU virtualization** — Loads `IA32_PERF_GLOBAL_CTRL=0` in VMX root, restores/saves the guest mask across transitions, validates RDPMC privilege/type/index/width, and compensates APERF/MPERF root deltas.
-- **Wall-clock virtualization** — ACPI-discovers HPET and virtualizes HPET main-counter plus xAPIC/x2APIC current-count reads. Per-vCPU EPT shadows and MTF close the MMIO permission window after one instruction.
+- **TSC compensation** — One-shot CPUID/RDTSC compensation preserves native CPUID cost without persistent per-core TSC offsets; unarmed RDTSC/RDTSCP returns the VM-exit entry TSC so forced RDTSC-exiting does not leak root residency.
 - **MSR emulation** — Intercepts TSC, APERF/MPERF, PERF_GLOBAL_CTRL, x2APIC current count, feature-control, and VMX capability surfaces. Only CPUID-advertised Hyper-V synthetic MSRs are forwarded to a parent; unsupported probes get guest #GP.
 - **External interrupt re-injection** — ACK-on-exit with deferred delivery via interrupt-window exiting when guest is not interruptible. TPR priority masking via shadowed CR8.
 - **IDT vectoring** — Re-injects interrupted IDT events with priority. NMI deferral via NMI-window exiting on collision. Exception combining per SDM Table 6-5 (#DF generation, triple fault on #DF+exception).
@@ -64,6 +69,8 @@ Intel VT-x Type-2 hypervisor research code for virtualizing an already running W
 ```
 include/
     hv.h                Master header, function prototypes
+    hv_attachment.h     Clean-room Hyper-V provider lifecycle ABI
+    hv_public.h         Stable wire records and attachment negotiation ABI
     hv_types.h          Per-VCPU state, EPT structures, VMCALL numbers
     ia32.h              Intel architecture defines (MSRs, VMCS fields, EPT, control bits)
     stealth.h           Anti-detection feature toggles and types
@@ -148,6 +155,26 @@ GitHub-hosted Windows CI runs the contract assertions and builds the user-mode p
 
 ***
 
+## Hyper-V attachment foundation
+
+[`lab/HYPERV_ATTACHMENT_ABI.md`](lab/HYPERV_ATTACHMENT_ABI.md) defines the
+versioned clean-room provider boundary. It uses public Microsoft TLFS
+discovery/privilege contracts only, never private Hyper-V symbols or patches,
+forbids a bare-metal `VMXON` fallback after Hyper-V discovery, requires
+idempotent rollback, and treats Secure Boot/TPM/measured-boot state as
+immutable policy inputs. This is an ABI foundation, not a completed provider
+or an anti-cheat compatibility claim.
+
+Read-only platform gates:
+
+```powershell
+pwsh -NoProfile -File .\tools\hyperv-attachment-preflight.ps1 -Mode probe
+pwsh -NoProfile -File .\tools\tpm-audit.ps1 `
+  -OutputPath .\build\tpm-measured-boot-audit.json
+```
+
+***
+
 ## Boot-time mode
 
 [`boot/OphionBootPkg`](boot/README.md) is the EDK2 boot-time build: a resident DXE driver starts the VMX layer before the Windows loader and establishes a coherent `Microsoft Hv` persona from the first Windows instruction. This is the only architecture that removes the post-boot hypervisor-transition discontinuity; it is compile-verified as a `RELEASE` EFI driver and must first be exercised with OVMF, not a production ESP or firmware flash.
@@ -210,18 +237,88 @@ pwsh -NoProfile -File .\tools\hyperv-attachment-preflight.ps1
 ```
 ## Loading
 
-Loading is intentionally not automated. An administrator can register a driver produced or signed for the target machine:
+Do not `sc.exe create/start` for an anti-cheat boot. That publishes a service,
+a `\Driver` object, a `PsLoadedModuleList` row, PiDDB, and ImageLoad ETW.
+`tracewipe_apply` unlinks those after `DriverEntry`; it cannot unsay ETW.
+
+AC bring-up, in order:
+
+1. **Boot** — `boot/OphionBoot.efi` owns VMX before `winload`. No Windows `.sys`.
+2. **Map** — build `Ophion-production.sys`, then emit a relocated blob and copy it with an external kernel write. Never `NtLoadDriver`.
 
 ```powershell
-$driver = (Resolve-Path .\build\bin\Release\Ophion.sys).Path
-sc.exe create Ophion type= kernel binPath= $driver
-sc.exe start Ophion
-
-sc.exe stop Ophion
-sc.exe delete Ophion
+pwsh -NoProfile -File .\build.ps1 -Configuration Release -Clean -WarningsAsErrors -Production
+pwsh -NoProfile -File .\tools\build-map.ps1 -Configuration Release -WarningsAsErrors
+$mappedBase = Read-Host 'Mapped image kernel VA'
+$ntBase = Read-Host 'Live ntoskrnl base'
+.\build\bin\Release\OphionMap.exe --image .\build\bin\Release\Ophion-production.sys --out .\build\map --base $mappedBase --ntos $env:SystemRoot\System32\ntoskrnl.exe --ntos-base $ntBase
 ```
 
-The default build is unsigned and will not load under normal Windows kernel-signing policy. Test-signing policy and certificate provisioning are operator-managed prerequisites.
+`ophion.map.json` v2 carries the relocated entry VA, image size, import/relocation
+state, and seal protocol metadata. `ophion.exec.bin` is the 25-byte Microsoft x64
+ABI adapter that calls the relocated production entry with null driver arguments.
+The mapper still does not allocate kernel memory or trigger execution; the external
+write/execute primitive owns placement, invocation, and recovery.
+
+The runtime invokes `ophion.exec.bin` first, with the mapped `.hvshare` page
+still zeroed. `DriverEntry` launches VMX, snapshots root metadata, and prepares concealment
+before returning. After every vCPU acknowledges the conceal VMCALL, EPT maps
+all host-only allocations and the mapped production image to the dummy page;
+only the `.hvshare` command doorbell remains guest-visible for bootstrap and
+command VMCALLs. Only then does the runtime generate a nonzero
+128-bit capability with its OS CSPRNG, initialize `sharedPageRva` as state
+`WRITING`, patch `ophion.bootstrap.bin`, and invoke bootstrap VMCALL `7` on one
+virtualized processor. VMX-root copies the capability into already-concealed
+state and securely erases both the shared payload and its local copy. The
+runtime retains the capability, executes seal VMCALL `5` once on every logical
+processor, then uses VMCALL `0x100` with strictly increasing sequences.
+Every READY command carries the manifest-declared `siphash-2-4x2-128` tag over
+command, epoch, sequence, lengths, and payload. VMX-root authenticates one local
+snapshot and signs every COMPLETE response over status, length, and payload;
+callers must reject a response whose 128-bit tag does not verify.
+For teardown it patches the capability and epoch slots in `ophion.stop.bin`,
+runs that thunk synchronously on every logical processor, verifies every return
+status, then invokes `ophion.cleanup.bin`. `OphionCleanup` refuses to free any
+allocation until `vmx_all_stopped()` proves that no vCPU still owns VMX state.
+
+Lab-only (probe / status device): a test-signed non-production image may still be registered locally. `tracewipe_apply` still unlinks the module list after launch.
+VulnDrivers ranking for a no-`sc` kernel write (this box):
+
+| Image | Use for Ophion map? |
+|---|---|
+| `12-DirectIo64_legacy` | **No on this host** — unrestricted DRAM R/W, but enforced Code Integrity rejects this hash as revoked (`0xC0000603`) and records the randomized path. |
+| `01-HWiNFO_x64` | No — WHQL/HVCI-clean but SENS-gated, cannot hit kernel PA. |
+| `11-AsIO3` / `09-AsIO3` | No — live test returns `ACCESS_DENIED` off the HAL/PnP windows. |
+| `13-DirectIo64-WHQL` | Read-only DRAM. |
+| `14-Eneio64` | Full phys R/W, loldrivers-famous. Worse name hit than a random-stem DirectIo. |
+| `06-cpuz` / `10-IOMap64` / `07-kerneld-x64` | Name-listed or hardcoded `\Device\AIDA64Driver`. |
+
+```powershell
+pwsh -NoProfile -File .\tools\build-load.ps1 -Configuration Release -WarningsAsErrors
+.\build\bin\Release\OphionLoad.exe --vuln C:\Users\Admin\Desktop\VulnDrivers\12-DirectIo64_legacy\DirectIo64_legacy.sys --smoke
+```
+
+Guarded wrapper (administrator check, backend validation, and fail-closed
+Hyper-V/VBS preflight):
+
+```powershell
+.\tools\run-safe.ps1 -Backend lnvmsrio -Existing `
+  -DevicePath \\.\WinMsrDev -Smoke -Walk
+```
+
+For a deterministic signature/hash/version/CI-policy report without loading
+anything:
+
+```powershell
+.\tools\driver-preflight.ps1 -Path .\LnvMSRIO.sys -Backend lnvmsrio
+```
+
+The schema (`ophion.driver-preflight.v1`) follows an Ophion-owned,
+fail-closed subset of KDU provider metadata and LOLDrivers sample metadata.
+It does not import mapper code, driver binaries, or service commands.
+
+
+
 
 ***
 ## Stealth Toggles
@@ -232,15 +329,36 @@ Defined in `include/stealth.h`:
 |--------|---------|-------------|
 | `STEALTH_ENABLED` | 1 | Master stealth switch |
 | `STEALTH_HIDE_CR4_VMXE` | 1 | Hide CR4.VMXE from guest via CR4 shadow |
-| `STEALTH_COMPENSATE_TIMING` | 1 | TSC compensation for RDTSC+CPUID+RDTSC timing attacks |
+| `STEALTH_COMPENSATE_TIMING` | 1 | Compensate selected CPUID/timer VM-exit residency |
 | `STEALTH_CPUID_CACHING` | 1 | Cache native CPUID responses for invalid/hypervisor leaves |
-| `USE_PRIVATE_HOST_CR3` | 0 | Disabled: avoids stale/invalid private page-table snapshots on current Windows builds |
 | `STEALTH_VIRTUALIZE_PMU` | 1 | Exclude VMX-root PMCs and compensate APERF/MPERF |
 | `STEALTH_VIRTUALIZE_TIMERS` | 1 | Virtualize HPET and LAPIC current-count reads |
+| `STEALTH_CONCEAL_HOST_PAGES` | 1 | Hide VMXON/VMCS/bitmap/root-stack allocations behind a read-only zero page; production also hides fixed EPT controls and the mapped image after initialization, while `.hvshare` remains visible for authenticated VMCALLs |
+| `STEALTH_WIPE_LOADER_TRACES` | 0 | Experimental only: loader-list/cache edits can violate PatchGuard or live loader invariants |
+| `STEALTH_EAC_STACK_SCRUB` | 0 | Unsafe heuristic stack rewriting is disabled |
+| `USE_PRIVATE_HOST_CR3` | 0 | Disabled: dynamic post-launch allocations are not added to the deep copy |
 | `USE_PRIVATE_HOST_IDT` | 1 | Isolated host IDT (prevents NMI hijacking in VMX-root) |
 | `USE_PRIVATE_HOST_GDT` | 1 | Per-core isolated host GDT |
+| `OPHION_ALLOW_UNLOAD` | 0 | Unload disabled until all vCPUs can prove VMXOFF completion |
+| `OPHION_ALLOW_NESTED` | 0 | Parent Hyper-V/VBS rejected because genuine hypercall pass-through is unavailable |
+
 
 ***
+
+## Read-only TPM audit
+
+`tools\tpm-audit.ps1` reproduces the observed EAC startup probes without
+creating, evicting, or changing TPM objects: two device-info calls,
+`ReadPublic(0x81000001)`, two deterministic
+`ReadPublic(0x810EAC00)` calls, and a handle-capability query.
+
+```powershell
+pwsh -NoProfile -File .\tools\tpm-audit.ps1
+```
+
+The output is local JSON (`ophion.tpm-audit.v1`). It is evidence only:
+Ophion does not forge TPM public objects, AIK signatures, PCR quotes, or
+remote-attestation responses.
 
 ## Runtime probe
 
@@ -254,6 +372,23 @@ pwsh -NoProfile -File .\tools\build-probe.ps1 -Configuration Release -WarningsAs
 
 The stable top-level schema identifier is `ophion.probe.v1`. Each processor record contains the processor group/number, CPUID leaf 1, Hyper-V base/interface leaves, two invalid-leaf responses, and paired `RDTSC-CPUID-RDTSC`/QPC deltas.
 
+
+Local source in `E:\Tools` can be built and sampled without modifying the
+upstream checkout:
+
+```powershell
+.\tools\run-local-detectors.ps1 -Seconds 6 -ProbeSamples 1000
+```
+
+Raw output and a run manifest are stored under
+`build\detector-results\<timestamp>`.
+
+For a failed bare-metal launch or bugcheck, collect reproducible event,
+minidump, and build hashes with:
+
+```powershell
+.\tools\collect-crash-artifacts.ps1 -Hours 24
+```
 ## Pinned detector sources
 
 `tools\detectors.json` pins public detector repositories and records their expected build command and result artifact. The management script never executes detector binaries. Without `-Fetch` it performs no network activity:
@@ -276,14 +411,16 @@ Evidence status as of **2026-08-25**:
 |---|---:|---:|---|
 | Portable unsigned driver build | Yes | No | Release and Debug x64 built with WDK 10.0.26100.0 and `/WX`; Native x64 PE headers verified by `build.ps1`. |
 | Optional test-signed driver build | Yes | No | Release signing and Authenticode verification passed with an injected local certificate thumbprint; kernel trust/loading was not exercised. |
-| Contract assertion script | Yes | N/A | `tests\contracts.ps1` passed 146 assertions. |
-| Platform data plane and mock client | Yes | Mock only | Unified VS2022 CMake preset builds the C++20 library, adapter/guest-reader/command-path tests, and client; `ctest` passed 1/1. No production VMM bridge exists yet. |
-| EAC/EOS fixture harness | Yes | Mock only | Python stdlib harness passed 10/10 recorded-fixture tests; local baseline capture is read-only and no anti-cheat binary was executed. |
-| Production stealth profile | Yes | No | Release production build passed `/WX`; binary scan confirmed no device path, log string, machine path, or project name in ASCII or UTF-16, PDB reference neutralized. |
-| `OphionBoot.efi` boot-time DXE driver | Yes | OVMF shell only | EDK2/VS2022 `RELEASE` build passed; SHA-256 `e051c6aafe092b6c348c0d276d8fcfa0bee14fb1778df29b4839c568d98ec823`. Embedded OVMF reached the UEFI Shell under TCG; TCG has no VMX, so VMLAUNCH is still pending nested-VMX hardware validation. |
-| VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and a captured status artifact. |
-| Detector compatibility | N/A | No | `vmaware.png` is retained as a historical image, but it lacks pinned revision/configuration/raw-result provenance and is not current verification. |
-| EAC, BattlEye, or antivirus compatibility | N/A | No | No reproducible artifact is tracked; no compatibility claim is made. |
+| Contract assertion script | Yes | N/A | `tests\contracts.ps1` validates safe-default, EPT, MTF, loader, and teardown invariants; assertion count is emitted by the script. |
+| Platform data plane and mock client | Yes | Mock only | Unified VS2022 CMake preset builds the C++20 library, adapter/guest-reader/command-path tests, and client. No production VMM bridge exists yet. |
+| EAC/EOS fixture harness | Yes | Mock only | Python stdlib harness uses recorded fixtures; no anti-cheat binary was executed. |
+| Production stealth profile | Yes | No | Production build removes the diagnostic device/log surface; runtime trust/loading still requires validation. |
+| `OphionBoot.efi` boot-time DXE driver | Yes | OVMF shell only | OVMF/TCG cannot validate VMX launch; nested/bare-metal validation remains pending. |
+| VMX launch, unload, and all-core status | N/A | No | Requires a compatible Intel host, a loadable signed/test-signed driver, and captured status/crash artifacts. |
+| Detector compatibility | N/A | No | Public detectors are pinned, but no current live detector run is claimed. |
+| Host-page concealment | Yes | No | Compile/contracts only. Safe default hides host-only allocations and, in production, the initialized mapped image except `.hvshare`; it uses a read-only dummy page and performs INVEPT through a root-mode VMCALL. |
+| Internal page protection | Yes | No | Current-process pages are pinned and execute-only for the owner CR3; foreign-CR3 registration fails closed. No live game/AC run is claimed. |
+| EAC, EOS, Ricochet, BattlEye | N/A | No | No build is “100% safe.” Vendor-specific and server-side verdict paths remain unvalidated. |
 
 ***
 

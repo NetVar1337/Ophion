@@ -115,13 +115,30 @@ ept_check_features(VOID)
     g_ept->mtf_supported =
         (proc_controls.Fields.High &
          CPU_BASED_VM_EXEC_CTRL_MONITOR_TRAP_FLAG) != 0;
+    g_ept->execute_only_supported =
+        vpid_reg.ExecuteOnlyPages ? TRUE : FALSE;
+    if (g_ept->execute_only_supported)
+        g_hv_capabilities.CapabilityFlags |= HV_CAP_EPT_EXEC_ONLY;
+    g_ept->invept_supported = vpid_reg.Invept ? TRUE : FALSE;
+    g_ept->invept_single_context =
+        vpid_reg.InveptSingleContext ? TRUE : FALSE;
+    g_ept->invept_all_contexts =
+        vpid_reg.InveptAllContexts ? TRUE : FALSE;
 
-    if (!vpid_reg.PageWalkLength4 || !vpid_reg.MemoryTypeWriteBack || !vpid_reg.Pde2MbPages)
+    if (!vpid_reg.PageWalkLength4 ||
+        !vpid_reg.MemoryTypeWriteBack ||
+        !vpid_reg.Pde2MbPages ||
+        !g_ept->invept_supported ||
+        !g_ept->invept_single_context)
     {
-        HV_LOG(0, 0, "[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
-                 (int)vpid_reg.PageWalkLength4,
-                 (int)vpid_reg.MemoryTypeWriteBack,
-                 (int)vpid_reg.Pde2MbPages);
+        HV_LOG(0, 0,
+            "[hv] EPT: Missing required features "
+            "(PW4=%d WB=%d 2MB=%d INVEPT=%d SINGLE=%d)\n",
+            (int)vpid_reg.PageWalkLength4,
+            (int)vpid_reg.MemoryTypeWriteBack,
+            (int)vpid_reg.Pde2MbPages,
+            (int)g_ept->invept_supported,
+            (int)g_ept->invept_single_context);
         return FALSE;
     }
 
@@ -168,23 +185,31 @@ ept_get_memory_type(SIZE_T pfn, BOOLEAN is_large_page)
                 break;
             }
 
-            if (target_type == MEMORY_TYPE_UNCACHEABLE)
+            if (target_type == (UINT8)-1)
             {
                 target_type = range->mem_type;
+                continue;
+            }
+            if (target_type == range->mem_type)
+                continue;
+            if (target_type == MEMORY_TYPE_UNCACHEABLE ||
+                range->mem_type == MEMORY_TYPE_UNCACHEABLE)
+            {
+                target_type = MEMORY_TYPE_UNCACHEABLE;
                 break;
             }
-
-            if (target_type == MEMORY_TYPE_WRITE_THROUGH ||
-                range->mem_type == MEMORY_TYPE_WRITE_THROUGH)
+            if ((target_type == MEMORY_TYPE_WRITE_BACK &&
+                 range->mem_type == MEMORY_TYPE_WRITE_THROUGH) ||
+                (target_type == MEMORY_TYPE_WRITE_THROUGH &&
+                 range->mem_type == MEMORY_TYPE_WRITE_BACK))
             {
-                if (target_type == MEMORY_TYPE_WRITE_BACK)
-                {
-                    target_type = MEMORY_TYPE_WRITE_THROUGH;
-                    continue;
-                }
+                target_type = MEMORY_TYPE_WRITE_THROUGH;
+                continue;
             }
 
-            target_type = range->mem_type;
+            /* Undefined overlap combinations are conservatively UC. */
+            target_type = MEMORY_TYPE_UNCACHEABLE;
+            break;
         }
     }
 
@@ -384,9 +409,11 @@ BOOLEAN
 ept_init(VOID)
 {
     EPT_POINTER eptp = {0};
+    PHYSICAL_ADDRESS max_phys;
 
-    g_ept = (EPT_STATE *)ExAllocatePool2(
-        POOL_FLAG_NON_PAGED, sizeof(EPT_STATE), HV_POOL_TAG);
+    max_phys.QuadPart = MAXULONG64;
+    g_ept = (EPT_STATE *)MmAllocateContiguousMemory(
+        sizeof(EPT_STATE), max_phys);
     if (!g_ept)
         return FALSE;
 
@@ -478,6 +505,10 @@ ept_split_large_page(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T phys_addr)
         return FALSE;
     if (!target->LargePage)
         return TRUE;
+#if OPHION_PRODUCTION
+    if (ept_conceal_is_frozen())
+        return FALSE;
+#endif
 
     max_phys.QuadPart = MAXULONG64;
     new_split = (PVMM_EPT_DYNAMIC_SPLIT)MmAllocateContiguousMemory(
@@ -510,6 +541,9 @@ ept_split_large_page(VIRTUAL_MACHINE_STATE * vcpu, SIZE_T phys_addr)
     new_ptr.PageFrameNumber = va_to_pa(&new_split->PML1[0]) / PAGE_SIZE;
     RtlCopyMemory(target, &new_ptr, sizeof(new_ptr));
     InsertTailList(&g_ept->hooked_pages, &new_split->SplitList);
+#if OPHION_PRODUCTION
+    ept_conceal_register_va(new_split, sizeof(*new_split));
+#endif
     return TRUE;
 }
 
@@ -564,6 +598,26 @@ ept_invept_single(VIRTUAL_MACHINE_STATE * vcpu)
         return TRUE;
     vcpu->failed = TRUE;
     vcpu->terminal = TRUE;
+    vcpu->last_failure = HV_FAILURE_INVEPT;
+    return FALSE;
+}
+
+BOOLEAN
+ept_invept_single_initializing(
+    VIRTUAL_MACHINE_STATE * vcpu)
+{
+    INVEPT_DESCRIPTOR desc = {0};
+
+    desc.EptPointer = vcpu->ept_pointer;
+    if (asm_invept(
+            InveptSingleContext, &desc) == 0)
+        return TRUE;
+    /*
+     * Keep VMX active so the all-core initialization rollback can issue its
+     * teardown VMCALL on every processor.  The normal runtime helper marks a
+     * failed vCPU terminal immediately.
+     */
+    vcpu->failed = TRUE;
     vcpu->last_failure = HV_FAILURE_INVEPT;
     return FALSE;
 }
@@ -869,6 +923,9 @@ VOID
 ept_handle_monitor_trap(VIRTUAL_MACHINE_STATE * vcpu)
 {
     UINT64 controls = 0;
+
+
+    protect_on_mtf(vcpu);
 
     if (vcpu->mtf_hook)
     {

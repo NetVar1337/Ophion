@@ -1,8 +1,8 @@
 # OphionBoot — boot-time Hyper-V persona
 
-`OphionBoot.efi` is an EDK2 x64 resident DXE driver that brings up Ophion before the Windows loader continues. It captures the UEFI caller's complete register frame, virtualizes every logical processor through `EFI_MP_SERVICES_PROTOCOL`, identity-maps firmware-declared RAM/MMIO with EPT, and presents a Microsoft Hyper-V CPUID/MSR/hypercall-page floor from the first Windows instruction.
+`OphionBoot.efi` is an EDK2 x64 resident DXE research driver that brings up Ophion before the Windows loader continues. It captures the UEFI caller's complete register frame, virtualizes every logical processor through `EFI_MP_SERVICES_PROTOCOL`, and identity-maps firmware-declared RAM/MMIO with EPT. The incomplete Microsoft Hyper-V persona is compile-gated off by default; production claims require effect-conformance tests for every advertised TLFS facility.
 
-This changes the detection model: Windows caches a coherent `Microsoft Hv` platform identity at boot, rather than observing a post-boot hidden VMX transition. It does **not** make virtualization physically unmeasurable; it establishes a legitimate Hyper-V-compatible identity from S0.
+With the safe default, CPUID remains native and synthetic Hyper-V MSRs and hypercalls are unsupported. The laboratory persona must not be enabled merely to obtain a `Microsoft Hv` vendor string.
 
 ## Build
 
@@ -89,10 +89,13 @@ Failure signatures:
 | terminal reason 4 or `OpbConcealAbort` | A local INVEPT or concealment rendezvous failed; do not continue the guest. |
 | OVMF resets or no serial progression after ReadyToBoot | Nested VMX is unavailable or the OVMF/QEMU CPU configuration cannot execute VMX. |
 
-`OphionBootConcealRuntime` and `OPB_ENABLE_RUNTIME_CONCEALMENT` remain
-disabled by default. Concealment contains no EPT code hook.
+`OphionBootConcealRuntime` and `OPB_ENABLE_RUNTIME_CONCEALMENT` default on.
+Concealment is a dummy-page GPA redirect with execute stripped. It is not an
+EPT code hook. A failed two-barrier INVEPT epoch terminalizes the guest.
+
 ## Current boundary
 
-This is a boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It provides only the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for selected flush/post-message calls. The allocation registry and dummy-page redirector are compile-present but disabled. When explicitly enabled for OVMF, concealment uses a two-barrier, all-launched-VCPU INVEPT epoch; it never uses EPT code hooks and terminalizes rather than allowing a failed barrier to resume a guest.
+This is a boot-time VMX/HV-persona foundation, not a firmware flasher or a finished Hyper-V implementation. It provides the boot-critical Hyper-V MSR/hypercall floor: guest OS ID, hypercall-page registration, VP index, and no-op success for selected flush/post-message/spin-wait calls. The allocation registry and dummy-page redirector run after the first 128 exits.
+
 
 Do not modify `bootmgfw.efi`, SPI flash, measured-boot state, TPM state, or a production ESP until the OVMF boot matrix is green.

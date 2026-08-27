@@ -24,6 +24,7 @@ struct ProcessorResult {
     BYTE number;
     DWORD pinError = ERROR_SUCCESS;
     CpuidResult leaf1{}, hypervisorBase{}, hypervisorInterface{}, invalidFixed{}, invalidMaxPlusOne{};
+    std::vector<std::pair<std::uint32_t, CpuidResult>> hypervisorLeaves;
     std::vector<TimingSample> samples;
 };
 struct DriverStatus {
@@ -76,8 +77,10 @@ void emitCpuid(std::ostream& out, const CpuidResult& v) {
 
 DriverStatus queryDriver() {
     DriverStatus result;
-    HANDLE device = CreateFileW(L"\\\\.\\Ophion", GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE device = CreateFileW(
+        L"\\\\.\\Ophion", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr);
     if (device == INVALID_HANDLE_VALUE) { result.error = GetLastError(); return result; }
 
     DWORD returned = 0;
@@ -126,6 +129,23 @@ bool pinAndMeasure(WORD group, BYTE number, unsigned sampleCount, ProcessorResul
     result.leaf1 = cpuid(1);
     result.hypervisorBase = cpuid(0x40000000u);
     result.hypervisorInterface = cpuid(0x40000001u);
+    if ((result.leaf1.ecx & 0x80000000u) != 0 &&
+        result.hypervisorBase.eax >= 0x40000001u &&
+        result.hypervisorBase.eax <= 0x400000ffu) {
+        const std::uint32_t last =
+            result.hypervisorBase.eax < 0x4000000au
+                ? result.hypervisorBase.eax
+                : 0x4000000au;
+        result.hypervisorLeaves.push_back(
+            {0x40000000u, result.hypervisorBase});
+        result.hypervisorLeaves.push_back(
+            {0x40000001u, result.hypervisorInterface});
+        for (std::uint32_t leaf = 0x40000002u;
+             leaf <= last; ++leaf) {
+            result.hypervisorLeaves.push_back(
+                {leaf, cpuid(leaf)});
+        }
+    }
     result.invalidFixed = cpuid(0x04201337u);
     result.invalidMaxPlusOne = cpuid(maxPlusOne);
     result.samples.reserve(sampleCount);
@@ -181,11 +201,23 @@ int emitError(const std::string& message) {
     std::cout << "{\"schema\":\"ophion.probe.v1\",\"error\":" << jsonString(message) << "}\n";
     return 2;
 }
+
+int emitHelp() {
+    std::cout
+        << "OphionProbe - all-core CPUID and timing probe\n"
+        << "usage: OphionProbe.exe [--samples 1..100000]\n"
+        << "       OphionProbe.exe --help\n";
+    return 0;
+}
 } // namespace
 
 int main(int argc, char** argv) {
     unsigned sampleCount = kDefaultSamples;
-    if (argc == 3 && std::string(argv[1]) == "--samples") {
+    if (argc == 2 &&
+        (std::string(argv[1]) == "--help" ||
+         std::string(argv[1]) == "-h")) {
+        return emitHelp();
+    } else if (argc == 3 && std::string(argv[1]) == "--samples") {
         char* end = nullptr;
         const unsigned long parsed = std::strtoul(argv[2], &end, 10);
         if (!end || *end != '\0' || parsed == 0 || parsed > 100000ul) return emitError("invalid --samples value");
@@ -220,6 +252,22 @@ int main(int argc, char** argv) {
         std::cout << "\"leaf1\":"; emitCpuid(std::cout, p.leaf1);
         std::cout << ",\"hypervisorBase\":"; emitCpuid(std::cout, p.hypervisorBase);
         std::cout << ",\"hypervisorInterface\":"; emitCpuid(std::cout, p.hypervisorInterface);
+        std::cout << ",\"hypervisorLeaves\":[";
+        for (std::size_t leaf = 0;
+             leaf < p.hypervisorLeaves.size(); ++leaf) {
+            if (leaf) std::cout << ',';
+            std::cout << "{\"leaf\":"
+                      << p.hypervisorLeaves[leaf].first << ',';
+            std::cout << "\"eax\":"
+                      << p.hypervisorLeaves[leaf].second.eax
+                      << ",\"ebx\":"
+                      << p.hypervisorLeaves[leaf].second.ebx
+                      << ",\"ecx\":"
+                      << p.hypervisorLeaves[leaf].second.ecx
+                      << ",\"edx\":"
+                      << p.hypervisorLeaves[leaf].second.edx << '}';
+        }
+        std::cout << ']';
         std::cout << ",\"invalidFixed\":"; emitCpuid(std::cout, p.invalidFixed);
         std::cout << ",\"invalidMaxPlusOne\":"; emitCpuid(std::cout, p.invalidMaxPlusOne);
         std::cout << "},\"timing\":[";

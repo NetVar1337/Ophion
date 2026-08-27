@@ -22,7 +22,16 @@
 #define OPB_POOL_ALIGNMENT  0x1000
 
 #ifndef OPB_ENABLE_RUNTIME_CONCEALMENT
-#define OPB_ENABLE_RUNTIME_CONCEALMENT 0
+#define OPB_ENABLE_RUNTIME_CONCEALMENT 1
+#endif
+
+/*
+ * The partial Microsoft Hv persona is a laboratory model, not a coherent
+ * TLFS implementation. Keep it fail-closed until every advertised CPUID bit,
+ * synthetic MSR, and successful hypercall has an effect-conformance test.
+ */
+#ifndef OPB_ENABLE_HYPERV_PERSONA
+#define OPB_ENABLE_HYPERV_PERSONA 0
 #endif
 
 #define OPB_MAX_RUNTIME_ALLOCS  256

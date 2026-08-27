@@ -112,6 +112,10 @@ typedef struct _EPT_STATE {
     BOOLEAN               invvpid_all_contexts;
     BOOLEAN               invvpid_single_retaining_globals;
     BOOLEAN               mtf_supported;
+    BOOLEAN               execute_only_supported;
+    BOOLEAN               invept_supported;
+    BOOLEAN               invept_single_context;
+    BOOLEAN               invept_all_contexts;
     BOOLEAN               hpet_counter_64bit;
     UINT64                hpet_physical;
     UINT64                hpet_period_fs;
@@ -147,6 +151,8 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // Kept first so the root NMI stub can set it without C/Windows calls.
     volatile LONG host_nmi_pending;
 
+    UINT64 original_cr0;
+    UINT64 original_cr4;
     UINT64 vmxon_va;
     UINT64 vmxon_pa;
     UINT64 vmcs_va;
@@ -177,6 +183,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     BOOLEAN     vmxon_active;
     BOOLEAN     detached;
     BOOLEAN     waitpkg_enabled;
+    BOOLEAN     vpid_enabled;
+    UINT32      primary_dynamic_forced;
+    BOOLEAN     protect_cr3_exiting;
     BOOLEAN     advance_rip;
     BOOLEAN     failed;
     BOOLEAN     terminal;
@@ -279,6 +288,14 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 
 #define VMCALL_TEST             0x00000001
 #define VMCALL_VMXOFF           0x00000002
+#define VMCALL_INVEPT           0x00000003
+#define VMCALL_PROTECT_REFRESH  0x00000004
+#define VMCALL_SEAL_STEP        HV_ROOT_VMCALL_SEAL_STEP
+#define VMCALL_STOP_STEP        HV_ROOT_VMCALL_STOP_STEP
+#define VMCALL_BOOTSTRAP_STEP   HV_ROOT_VMCALL_BOOTSTRAP_STEP
+#define VMCALL_ROOT_COMMAND     HV_ROOT_VMCALL_COMMAND
+#define VMCALL_CONCEAL_COMMIT   0x00007FFD
+#define VMCALL_INIT_ROLLBACK    0x00007FFE
 
 
 typedef struct _HOST_IDT_STATE {
@@ -295,3 +312,5 @@ extern HV_CAPABILITY_RECORD        g_hv_capabilities;
 extern UINT64                  g_system_cr3;
 extern UINT64 *                g_msr_bitmap_invalid;
 extern HOST_IDT_STATE          g_host_idt;
+extern volatile LONG           g_vmxoff_nmi_deferred;
+extern volatile LONG           g_vmxoff_transition_count;

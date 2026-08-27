@@ -45,4 +45,4 @@
 [PcdsFixedAtBuild]
   gOphionBootPkgTokenSpaceGuid.OphionBootMaxProcessors|64
 
-  gOphionBootPkgTokenSpaceGuid.OphionBootConcealRuntime|FALSE
+  gOphionBootPkgTokenSpaceGuid.OphionBootConcealRuntime|TRUE

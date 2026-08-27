@@ -105,7 +105,8 @@ function Get-Wdk([string]$KitsRoot, [string]$RequestedVersion) {
 }
 
 $repo = $PSScriptRoot
-$objDir = Join-Path $repo "build\obj\$Configuration"
+$profile = if ($Production) { 'Production' } else { 'Diagnostic' }
+$objDir = Join-Path $repo "build\obj\$Configuration-$profile"
 $binDir = Join-Path $repo "build\bin\$Configuration"
 $output = Join-Path $binDir 'Ophion.sys'
 if ($Production) { $output = Join-Path $binDir 'Ophion-production.sys' }
@@ -131,6 +132,7 @@ New-Item -ItemType Directory -Force -Path $objDir, $binDir | Out-Null
 
 $compile = @(
     '/nologo', '/c', '/kernel', '/W4', '/Zp8', '/GS', '/Gy', '/Zi', '/FC',
+    "/Fd$(Join-Path $objDir 'compiler.pdb')",
     '/diagnostics:caret', '/volatile:iso', '/std:c17',
     '/D_AMD64_', '/DAMD64', '/DWINNT=1', '/DUNICODE', '/D_UNICODE',
     "/I$(Join-Path $repo 'include')",
@@ -145,11 +147,33 @@ if ($Configuration -eq 'Release') {
     $compile += @('/Od', '/Ob0', '/D_DEBUG', '/DDBG=1')
 }
 if ($WarningsAsErrors) { $compile += '/WX' }
-if ($Production) { $compile += '/DOPHION_PRODUCTION=1' }
+if ($Production) {
+    $compile += @(
+        '/DOPHION_PRODUCTION=1',
+        '/DOPHION_EXPERIMENTAL_MUTATIONS=0',
+        '/DSTEALTH_WIPE_LOADER_TRACES=0',
+        '/DSTEALTH_EAC_STACK_SCRUB=0',
+        '/DSTEALTH_CONCEAL_BYOVD=0',
+        '/DSTEALTH_EAC_PATCH_KD=0',
+        '/DSTEALTH_EAC_PATCH_KSD=0',
+        '/DSTEALTH_EAC_CONCEAL_DMAR=0',
+        '/DSTEALTH_EAC_ZERO_HVL=0',
+        '/DSTEALTH_EAC_SPOOF_SMBIOS=0',
+        '/DSTEALTH_EAC_PATCH_VSL=0')
+}
 if ($CodeAnalysis) { $compile += '/analyze' }
 
+$productionExcluded = @('byovd_conceal.c', 'eac_stealth.c', 'tracewipe.c')
+$sources = @(Get-ChildItem -LiteralPath (Join-Path $repo 'src') -Filter '*.c' -File |
+    Where-Object { $_.Name -ne 'production_safe_profile.c' } |
+    Sort-Object Name)
+if ($Production) {
+    $sources = @($sources | Where-Object { $productionExcluded -notcontains $_.Name })
+    $safeProfile = Get-Item -LiteralPath (Join-Path $repo 'src\production_safe_profile.c')
+    if ($sources.FullName -notcontains $safeProfile.FullName) { $sources += $safeProfile }
+}
 $objects = [System.Collections.Generic.List[string]]::new()
-foreach ($source in Get-ChildItem -LiteralPath (Join-Path $repo 'src') -Filter '*.c' -File | Sort-Object Name) {
+foreach ($source in $sources) {
     $object = Join-Path $objDir ($source.BaseName + '.obj')
     Invoke-Native $cl ($compile + @("/Fo$object", $source.FullName))
     $objects.Add($object)
@@ -163,7 +187,7 @@ foreach ($source in Get-ChildItem -LiteralPath (Join-Path $repo 'asm') -Filter '
 }
 if ($objects.Count -eq 0) { throw 'No C or MASM source files were found.' }
 
-$libraryNames = @('ntoskrnl.lib', 'hal.lib', 'wmilib.lib', 'aux_klib.lib', 'BufferOverflowFastFailK.lib')
+$libraryNames = @('ntoskrnl.lib', 'hal.lib', 'wmilib.lib', 'aux_klib.lib', 'wdmsec.lib', 'BufferOverflowFastFailK.lib')
 $libraries = foreach ($name in $libraryNames) {
     $path = Join-Path $wdk.Library $name
     if (-not (Test-Path $path)) { throw "Required WDK library not found: $path" }
@@ -174,7 +198,7 @@ $linkArgs = @(
     '/NOLOGO', "/OUT:$output", '/MACHINE:X64', '/SUBSYSTEM:NATIVE', '/DRIVER',
     '/KERNEL', '/ENTRY:DriverEntry', '/NODEFAULTLIB', '/INCREMENTAL:NO',
     '/MANIFEST:NO', '/DYNAMICBASE', '/NXCOMPAT', '/DEBUG',
-    "/PDB:$pdbPath"
+    "/PDB:$pdbPath", "/MAP:$([IO.Path]::ChangeExtension($output, '.map'))"
 )
 if ($Production) {
     # keep symbols locally but never embed the build machine's path or the
@@ -187,11 +211,27 @@ if ($Configuration -eq 'Release') {
     $linkArgs += @('/OPT:NOREF', '/OPT:NOICF')
 }
 Invoke-Native $link ($linkArgs + $objects.ToArray() + $libraries)
+$objectManifest = [pscustomobject][ordered]@{
+    Schema = 'ophion.driver-object-manifest.v1'
+    Profile = $profile
+    Configuration = $Configuration
+    Sources = @($sources | ForEach-Object { $_.Name })
+    Objects = @($objects | ForEach-Object { [IO.Path]::GetFileName($_) })
+}
+$objectManifest | ConvertTo-Json -Depth 4 |
+    Set-Content -LiteralPath ([IO.Path]::ChangeExtension($output, '.objects.json')) -Encoding UTF8
 
 $headers = (& $dumpbin /nologo /headers $output 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) { throw 'dumpbin failed while verifying the output PE headers.' }
 if ($headers -notmatch '(?im)^\s*8664\s+machine\s+\(x64\)') { throw 'Output verification failed: PE machine is not x64.' }
 if ($headers -notmatch '(?im)^\s*1\s+subsystem\s+\(Native\)') { throw 'Output verification failed: PE subsystem is not Native.' }
+if ($Production) {
+    & (Join-Path $repo 'tools\verify-production-boundary.ps1') `
+        -Path $output `
+        -DumpbinPath $dumpbin `
+        -ObjectManifestPath ([IO.Path]::ChangeExtension($output, '.objects.json'))
+    if ($LASTEXITCODE -ne 0) { throw 'Production boundary verification failed.' }
+}
 
 if ($CertificateThumbprint) {
     $thumbprint = ($CertificateThumbprint -replace '\s', '').ToUpperInvariant()

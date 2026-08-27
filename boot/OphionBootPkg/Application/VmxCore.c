@@ -118,7 +118,6 @@
 #define EXECCTRL_CR8_STORE_EXIT        BIT20
 #define EXECCTRL_NMI_WINDOW_EXIT       BIT22
 #define EXECCTRL_MOV_DR_EXIT           BIT23
-#define EXECCTRL_CPUID_EXIT            BIT21
 #define EXECCTRL_USE_MSR_BITMAP        BIT28
 #define EXECCTRL_USE_IO_BITMAPS        BIT25
 #define EXECCTRL_ACTIVATE_SECONDARY    BIT31
@@ -682,7 +681,7 @@ OpbApplyConcealment (
             Leaf->PageFrame = g_opb_dummy_page >> 12;
             Leaf->Read = 1;
             Leaf->Write = 1;
-            Leaf->Execute = 1;
+            Leaf->Execute = 0;
             Leaf->Type = 6;
         }
     }
@@ -1111,7 +1110,6 @@ OpbSetupCurrentCore (
                           PINCTRL_EXTINT_EXIT | PINCTRL_NMI_EXIT |
                           PINCTRL_VIRTUAL_NMI, 0x48D);
         ProcControls = OpbAdjustControls (
-                         EXECCTRL_CPUID_EXIT |
                          EXECCTRL_HLT_EXIT |
                          EXECCTRL_INVLPG_EXIT |
                          EXECCTRL_CR3_LOAD_EXIT |
@@ -1131,7 +1129,6 @@ OpbSetupCurrentCore (
                           PINCTRL_EXTINT_EXIT | PINCTRL_NMI_EXIT |
                           PINCTRL_VIRTUAL_NMI, 0x481);
         ProcControls = OpbAdjustControls (
-                         EXECCTRL_CPUID_EXIT |
                          EXECCTRL_HLT_EXIT |
                          EXECCTRL_INVLPG_EXIT |
                          EXECCTRL_CR3_LOAD_EXIT |
@@ -1152,7 +1149,6 @@ OpbSetupCurrentCore (
         !(PinControls & PINCTRL_NMI_EXIT) ||
         !(ProcControls & EXECCTRL_ACTIVATE_SECONDARY) ||
         !(Proc2Controls & PROC2_ENABLE_EPT) ||
-        !(ProcControls & EXECCTRL_CPUID_EXIT) ||
         !(ExitControls & EXITCTRL_ACK_INTERRUPT)) {
         return EFI_UNSUPPORTED;
     }

@@ -254,6 +254,19 @@ hostcr3_get(VOID)
 }
 
 VOID
+hostcr3_register_conceal(VOID)
+{
+    UINT32 i;
+
+    for (i = 0; i < g_host_pt_count; i++)
+    {
+        if (g_host_pt_pages[i])
+            ept_conceal_register_va(g_host_pt_pages[i], PAGE_SIZE);
+    }
+}
+
+
+VOID
 hostcr3_destroy(VOID)
 {
     for (UINT32 i = 0; i < g_host_pt_count; i++)

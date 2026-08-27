@@ -36,6 +36,38 @@
 
 // Virtualize guest-visible HPET/LAPIC count reads with per-vCPU EPT shadows.
 #define STEALTH_VIRTUALIZE_TIMERS           1
+//
+// Hide selected host-only VMXON/VMCS/bitmap/root-stack allocations behind
+// a read-only zero page.  Live guest image/state is excluded.  Production
+// additionally hides fixed EPT controls; diagnostic mode leaves them visible
+// for post-launch protection registration.
+#define STEALTH_CONCEAL_HOST_PAGES          1
+//
+// Destructive cache/list manipulation is opt-in only.  It is not required
+// for VMX correctness and can trip PatchGuard or invalidate live loader state.
+#ifndef STEALTH_WIPE_LOADER_TRACES
+#define STEALTH_WIPE_LOADER_TRACES          0
+#endif
+
+// Heuristic kernel-stack rewriting is unsafe without unwind metadata.
+#ifndef STEALTH_EAC_STACK_SCRUB
+#define STEALTH_EAC_STACK_SCRUB             0
+#endif
+
+// Unload is disabled until every launched vCPU can prove VMXOFF completion.
+#ifndef OPHION_ALLOW_UNLOAD
+#define OPHION_ALLOW_UNLOAD                  0
+#endif
+
+// Genuine Hyper-V/VBS hypercall pass-through is not implemented.
+#ifndef OPHION_ALLOW_NESTED
+#define OPHION_ALLOW_NESTED                  0
+#endif
+
+
+
+
+
 
 //
 // use private (deep-copied) host page tables for VMCS_HOST_CR3
@@ -116,6 +148,11 @@ typedef struct _STEALTH_CPUID_CACHE {
     // if forced, we can't toggle it off — just use the armed flag.
     //
     BOOLEAN rdtsc_exiting_forced;
+    //
+    // min FYL2XP1 cost. void-stack scores VM when this is <= CPUID cost.
+    //
+    UINT64  bare_metal_fyl2xp1_cost;
+
 
 } STEALTH_CPUID_CACHE;
 

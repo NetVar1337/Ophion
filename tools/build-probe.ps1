@@ -22,8 +22,10 @@ if (-not $vswhere -or -not (Test-Path $vswhere)) {
 }
 if (-not $vswhere -or -not (Test-Path $vswhere)) { throw 'vswhere.exe was not found.' }
 
-$vs = (& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0 -or -not $vs) { throw 'No Visual Studio installation with x64 C++ tools was found.' }
+$vsOutput = @(& $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+$vswhereExit = $LASTEXITCODE
+$vs = $vsOutput | Where-Object { $_ } | Select-Object -First 1
+if ($vswhereExit -ne 0 -or -not $vs) { throw 'No Visual Studio installation with x64 C++ tools was found.' }
 $toolset = Get-ChildItem -LiteralPath (Join-Path $vs.Trim() 'VC\Tools\MSVC') -Directory | Where-Object {
     Test-Path (Join-Path $_.FullName 'bin\Hostx64\x64\cl.exe')
 } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1

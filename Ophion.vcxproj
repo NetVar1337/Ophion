@@ -46,6 +46,7 @@
     <IntDir>$(ProjectDir)build\obj\$(Configuration)\</IntDir>
     <TargetName>Ophion</TargetName>
     <TargetExt>.sys</TargetExt>
+    <OphionArtifactProfile>Diagnostic</OphionArtifactProfile>
     <SignMode Condition="'$(OphionCertificateThumbprint)' == ''">Off</SignMode>
     <SignMode Condition="'$(OphionCertificateThumbprint)' != ''">TestSign</SignMode>
     <TestCertificate Condition="'$(OphionCertificateThumbprint)' != ''">$(OphionCertificateThumbprint)</TestCertificate>
@@ -104,6 +105,7 @@
   <!-- Source Files -->
   <ItemGroup>
     <ClCompile Include="src\driver.c" />
+    <ClCompile Include="src\attachment.c" />
     <ClCompile Include="src\vmx.c" />
     <ClCompile Include="src\vmexit.c" />
     <ClCompile Include="src\ept.c" />
@@ -115,6 +117,14 @@
     <ClCompile Include="src\hostcr3.c" />
     <ClCompile Include="src\hostidt.c" />
     <ClCompile Include="src\hostgdt.c" />
+    <ClCompile Include="src\conceal.c" />
+    <ClCompile Include="src\eac_stealth.c" />
+    <ClCompile Include="src\byovd_conceal.c" />
+    <ClCompile Include="src\protect.c" />
+    <ClCompile Include="src\root_transport.c" />
+    <ClCompile Include="src\tracewipe.c" />
+
+
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>
@@ -134,6 +144,7 @@
     <ClInclude Include="include\hv_types.h" />
     <ClInclude Include="include\asm_prototypes.h" />
     <ClInclude Include="include\stealth.h" />
+    <ClInclude Include="include\hv_attachment.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

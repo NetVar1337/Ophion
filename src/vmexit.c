@@ -241,21 +241,63 @@ parent_hyperv_msr_supported(UINT32 msr, BOOLEAN write)
     }
 }
 
+static BOOLEAN
+vmexit_sync_dynamic_exiting(VIRTUAL_MACHINE_STATE * vcpu)
+{
+    UINT64 controls = 0;
+    UINT64 next;
+    const UINT64 mask =
+        CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING |
+        CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
+
+    if (!vmx_vmread_checked(
+            vcpu,
+            VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+            &controls))
+        return FALSE;
+
+    next = (controls & ~mask) |
+           (vcpu->primary_dynamic_forced & mask);
+
+    if (vcpu->protect_cr3_exiting || vcpu->tsc_rdtsc_armed)
+        next |= CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING;
+    if (vcpu->tsc_rdtsc_armed)
+        next |= CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
+
+    return next == controls ||
+           vmx_vmwrite_checked(
+               vcpu,
+               VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
+               next);
+}
+
 
 #define VMXOFF_SAVED_RFLAGS_OFFSET 0x190
 #define VMXOFF_RETURN_RSP_OFFSET   0x1A0
 
-static VOID
+static BOOLEAN
 vmexit_leave_vmx(VIRTUAL_MACHINE_STATE * vcpu, UINT64 return_rip, BOOLEAN handoff)
 {
     UINT64 guest_rsp = 0;
     UINT64 guest_rflags = 0;
+    UINT64 guest_cr0 = 0;
     UINT64 guest_cr3 = 0;
+    UINT64 guest_cr4 = 0;
+    UINT64 guest_dr7 = 0;
+    UINT64 guest_debugctl = 0;
+    UINT64 guest_fs_base = 0;
+    UINT64 guest_gs_base = 0;
     UINT64 guest_perf = 0;
 
     __vmx_vmread(VMCS_GUEST_RSP, &guest_rsp);
     __vmx_vmread(VMCS_GUEST_RFLAGS, &guest_rflags);
+    __vmx_vmread(VMCS_GUEST_CR0, &guest_cr0);
     __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
+    __vmx_vmread(VMCS_GUEST_CR4, &guest_cr4);
+    __vmx_vmread(VMCS_GUEST_DR7, &guest_dr7);
+    __vmx_vmread(VMCS_GUEST_DEBUGCTL, &guest_debugctl);
+    __vmx_vmread(VMCS_GUEST_FS_BASE, &guest_fs_base);
+    __vmx_vmread(VMCS_GUEST_GS_BASE, &guest_gs_base);
     if (vcpu->pmu_isolated)
         __vmx_vmread(VMCS_GUEST_PERF_GLOBAL_CTRL, &guest_perf);
 
@@ -269,7 +311,14 @@ vmexit_leave_vmx(VIRTUAL_MACHINE_STATE * vcpu, UINT64 return_rip, BOOLEAN handof
     *(UINT64 *)((PUCHAR)vcpu->regs + VMXOFF_RETURN_RSP_OFFSET) =
         guest_rsp - sizeof(UINT64);
 
-    __vmx_off();
+    _InterlockedIncrement(&g_vmxoff_transition_count);
+    if (asm_vmxoff_checked() != 0)
+    {
+        _InterlockedDecrement(&g_vmxoff_transition_count);
+        vcpu->failed = TRUE;
+        vcpu->last_failure = HV_FAILURE_VM_ENTRY;
+        return FALSE;
+    }
     vcpu->vmxon_active = FALSE;
     vcpu->launched = FALSE;
     vcpu->detached = handoff;
@@ -281,6 +330,7 @@ vmexit_leave_vmx(VIRTUAL_MACHINE_STATE * vcpu, UINT64 return_rip, BOOLEAN handof
         asm_reload_idtr((PVOID)g_host_idt.original_idt_base,
                         IDT_NUM_ENTRIES * sizeof(IDT_GATE_DESCRIPTOR_64) - 1);
 #endif
+    _InterlockedDecrement(&g_vmxoff_transition_count);
 
 #if USE_PRIVATE_HOST_GDT
     if (vcpu->host_gdt)
@@ -296,13 +346,19 @@ vmexit_leave_vmx(VIRTUAL_MACHINE_STATE * vcpu, UINT64 return_rip, BOOLEAN handof
 
     if (vcpu->pmu_isolated)
         __writemsr(IA32_PERF_GLOBAL_CTRL, guest_perf);
-
+    __writemsr(IA32_DEBUGCTL, guest_debugctl);
+    __writemsr(IA32_FS_BASE, guest_fs_base);
+    __writemsr(IA32_GS_BASE, guest_gs_base);
+    __writedr(7, guest_dr7);
+    __writecr0(guest_cr0);
     if (handoff)
-        __writecr4(__readcr4() | CR4_VMX_ENABLE_FLAG);
+        guest_cr4 |= CR4_VMX_ENABLE_FLAG;
     else
-        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
+        guest_cr4 &= ~CR4_VMX_ENABLE_FLAG;
+    __writecr4(guest_cr4);
 
     vcpu->vmxoff.executed = TRUE;
+    return TRUE;
 }
 
 //
@@ -364,10 +420,10 @@ vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
             cpu_info[2] &= ~(1 << 5);
     }
 
-    regs->rax = (UINT64)cpu_info[0];
-    regs->rbx = (UINT64)cpu_info[1];
-    regs->rcx = (UINT64)cpu_info[2];
-    regs->rdx = (UINT64)cpu_info[3];
+    regs->rax = (UINT64)(UINT32)cpu_info[0];
+    regs->rbx = (UINT64)(UINT32)cpu_info[1];
+    regs->rcx = (UINT64)(UINT32)cpu_info[2];
+    regs->rdx = (UINT64)(UINT32)cpu_info[3];
 }
 
 //
@@ -735,45 +791,71 @@ vmexit_handle_mov_cr(VIRTUAL_MACHINE_STATE * vcpu)
 
         case 3:
         {
-            //
-            // MOV to CR3: handle pcid no-invalidate (bit 63) and flush tlb
-            //
-            // with vpid enabled, intercepting mov cr3 prevents the hardware
-            // from flushing stale guest tlb entries. must call invvpid to
-            // maintain tlb coherency unless the pcid no-invalidate bit is set
-            //
-            // bit 63 must be 0 in VMCS_GUEST_CR3 for vm-entry to succeed
-            //
-            UINT64  new_cr3  = *reg_ptr;
+            UINT64 new_cr3 = *reg_ptr;
+            UINT64 guest_cr4 = 0;
+            UINT64 addr;
+            UINT64 high_mask;
+            UINT64 pcid = new_cr3 & 0xFFFULL;
+            UINT32 phys_bits =
+                root_transport_physical_address_bits();
+            BOOLEAN pcide;
             BOOLEAN no_flush = (new_cr3 >> 63) & 1;
 
-            __vmx_vmwrite(VMCS_GUEST_CR3, new_cr3 & ~(1ULL << 63));
+            if (!phys_bits)
+                phys_bits = 52;
 
-            if (!no_flush)
+            __vmx_vmread(VMCS_GUEST_CR4, &guest_cr4);
+            pcide = (guest_cr4 & (1ULL << 17)) != 0;
+            addr = new_cr3 & 0x7FFFFFFFFFFFF000ULL;
+            high_mask = phys_bits < 63
+                ? (~((1ULL << phys_bits) - 1ULL) &
+                   0x7FFFFFFFFFFFF000ULL)
+                : 0;
+
+            if ((addr & high_mask) ||
+                (!pcide && (no_flush || (pcid & ~0x18ULL))) ||
+                (pcide && no_flush && pcid == 0))
             {
-                //
-                // prefer RetainingGlobals (type 3) to preserve global kernel
-                // tlb entries — matches bare-metal mov cr3 behavior
-                //
+                vmexit_inject_gp();
+                vcpu->advance_rip = FALSE;
+                break;
+            }
+
+            __vmx_vmwrite(
+                VMCS_GUEST_CR3,
+                new_cr3 & ~(1ULL << 63));
+            protect_on_cr3_load(
+                vcpu,
+                new_cr3 & ~(1ULL << 63));
+            if (vcpu->terminal)
+                break;
+
+            if (!no_flush && vcpu->vpid_enabled)
+            {
                 INVVPID_DESCRIPTOR desc = {0};
+                UINT8 ret = 1;
                 desc.Vpid = VPID_TAG;
 
-                UINT8 ret;
                 if (g_ept->invvpid_single_retaining_globals)
-                {
-                    ret = asm_invvpid(InvvpidSingleContextRetainingGlobals, &desc);
-                }
-                else
-                {
-                    ret = asm_invvpid(InvvpidSingleContext, &desc);
-                }
-
+                    ret = asm_invvpid(
+                        InvvpidSingleContextRetainingGlobals,
+                        &desc);
+                if (ret != 0 &&
+                    g_ept->invvpid_single_context)
+                    ret = asm_invvpid(
+                        InvvpidSingleContext,
+                        &desc);
+                if (ret != 0 &&
+                    g_ept->invvpid_all_contexts)
+                    ret = asm_invvpid(
+                        InvvpidAllContexts,
+                        &desc);
                 if (ret != 0)
                 {
-                    //
-                    // fallback: all-contexts flush (always supported)
-                    //
-                    asm_invvpid(InvvpidAllContexts, &desc);
+                    vcpu->failed = TRUE;
+                    vcpu->terminal = TRUE;
+                    vcpu->last_failure = HV_FAILURE_INVVPID;
+                    vcpu->advance_rip = FALSE;
                 }
             }
             break;
@@ -913,11 +995,43 @@ vmexit_handle_ept_violation(VIRTUAL_MACHINE_STATE * vcpu)
         return;
     }
 
+
+    if (protect_handle_violation(vcpu, guest_phys))
+    {
+        if (vcpu->terminal)
+            vmexit_enter_terminal(
+                vcpu,
+                vcpu->last_failure
+                    ? vcpu->last_failure
+                    : HV_FAILURE_EPT_MISCONFIGURATION);
+        vcpu->advance_rip = FALSE;
+        return;
+    }
     if (ept_handle_mmio_violation(vcpu, guest_phys))
     {
         vcpu->advance_rip = FALSE;
         return;
     }
+    if (ept_conceal_is_hidden(guest_phys))
+    {
+        VMX_EXIT_QUALIFICATION_EPT_VIOLATION qual;
+        UINT64 guest_linear = guest_phys;
+        UINT32 error_code = 0;
+
+        qual.AsUInt = vcpu->exit_qual;
+        if (qual.ValidGuestLinearAddress)
+            __vmx_vmread(VMCS_GUEST_LINEAR_ADDRESS, &guest_linear);
+        if (qual.WriteAccess)
+            error_code |= 0x2;
+        if (qual.UserModeLinearAddress)
+            error_code |= 0x4;
+        if (qual.ExecuteAccess)
+            error_code |= 0x10;
+        vmexit_inject_pf(error_code, guest_linear);
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
     if (vcpu->terminal)
     {
         vmexit_enter_terminal(
@@ -936,44 +1050,202 @@ VOID
 vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
 {
     PGUEST_REGS regs = vcpu->regs;
+    UINT64 guest_cs_selector = 0;
+    UINT64 guest_cs_ar = 0;
+    UINT64 vmcall_num;
+    NTSTATUS status;
 
     //
-    // reject VMCALL from ring 3 — only kernel callers allowed
+    // Both selector RPL and descriptor DPL must identify ring 0.
     //
-    {
-        size_t guest_cs_ar = 0;
-        __vmx_vmread(VMCS_GUEST_CS_ACCESS_RIGHTS, &guest_cs_ar);
-        if (((guest_cs_ar >> 5) & 3) != 0)
-        {
-            vmexit_inject_ud();
-            vcpu->advance_rip = FALSE;
-            return;
-        }
-    }
-
-    if (regs->r10 != 0x48564653ULL ||       // 'HVFS'
-        regs->r11 != 0x564d43414c4cULL ||   // 'VMCALL'
-        regs->r12 != 0x4e4f485950455256ULL)  // 'NOHYPERV'
+    if (!vmx_vmread_checked(
+            vcpu, VMCS_GUEST_CS_SELECTOR, &guest_cs_selector) ||
+        !vmx_vmread_checked(
+            vcpu, VMCS_GUEST_CS_ACCESS_RIGHTS, &guest_cs_ar) ||
+        (guest_cs_selector & 3) != 0 ||
+        ((guest_cs_ar >> 5) & 3) != 0)
     {
         vmexit_inject_ud();
         vcpu->advance_rip = FALSE;
         return;
     }
 
-    UINT64 vmcall_num = regs->rcx;
+    if (regs->r10 != HV_VMCALL_FRAME_R10 ||
+        regs->r11 != HV_VMCALL_FRAME_R11 ||
+        regs->r12 != HV_VMCALL_FRAME_R12)
+    {
+        vmexit_inject_ud();
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
+    vmcall_num = regs->rcx;
+
+#if OPHION_PRODUCTION
+    if (vmcall_num != VMCALL_BOOTSTRAP_STEP &&
+        vmcall_num != VMCALL_SEAL_STEP &&
+        vmcall_num != VMCALL_STOP_STEP &&
+        vmcall_num != VMCALL_CONCEAL_COMMIT &&
+        vmcall_num != VMCALL_INIT_ROLLBACK &&
+        vmcall_num != VMCALL_ROOT_COMMAND &&
+        !root_transport_legacy_allowed(vmcall_num))
+    {
+        vmexit_inject_ud();
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+#endif
 
     switch (vmcall_num)
     {
+    case VMCALL_BOOTSTRAP_STEP:
+        status = root_transport_bootstrap(
+            vcpu, regs->rdx, regs->r8, regs->r9);
+        regs->rax = (UINT64)status;
+        break;
+
+    case VMCALL_SEAL_STEP:
+        status = root_transport_seal_step(
+            vcpu, regs->rdx, regs->r8, regs->r9);
+        if (status == STATUS_ACCESS_DENIED)
+        {
+            vmexit_inject_ud();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+        regs->rax = (UINT64)status;
+        break;
+
+    case VMCALL_ROOT_COMMAND:
+        status = root_transport_command(
+            vcpu, regs->rdx, regs->r8, regs->r9);
+        if (status == STATUS_ACCESS_DENIED)
+        {
+            vmexit_inject_ud();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+        regs->rax = (UINT64)status;
+        break;
+
+    case VMCALL_STOP_STEP:
+    {
+        UINT64 instr_len = 0;
+
+        status = root_transport_stop_begin(
+            vcpu, regs->rdx, regs->r8, regs->r9);
+        if (status == STATUS_ACCESS_DENIED)
+        {
+            vmexit_inject_ud();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+        if (!NT_SUCCESS(status))
+        {
+            regs->rax = (UINT64)status;
+            break;
+        }
+        if (!vmx_vmread_checked(
+                vcpu,
+                VMCS_VMEXIT_INSTRUCTION_LENGTH,
+                &instr_len))
+        {
+            root_transport_stop_complete(vcpu, FALSE);
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+
+        regs->rax = (UINT64)STATUS_SUCCESS;
+        if (vmexit_leave_vmx(
+                vcpu,
+                vcpu->vmexit_rip + instr_len,
+                FALSE))
+        {
+            root_transport_stop_complete(vcpu, TRUE);
+        }
+        else
+        {
+            root_transport_stop_complete(vcpu, FALSE);
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+        }
+        break;
+    }
+
+    case VMCALL_INIT_ROLLBACK:
+    {
+        UINT64 instr_len = 0;
+
+        if (!root_transport_initializing_rollback_allowed())
+        {
+            vmexit_inject_ud();
+            vcpu->advance_rip = FALSE;
+            return;
+        }
+        if (!vmx_vmread_checked(
+                vcpu,
+                VMCS_VMEXIT_INSTRUCTION_LENGTH,
+                &instr_len))
+        {
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+        regs->rax = (UINT64)STATUS_SUCCESS;
+        if (!vmexit_leave_vmx(
+                vcpu,
+                vcpu->vmexit_rip + instr_len,
+                FALSE))
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+    }
+
     case VMCALL_TEST:
         regs->rax = (UINT64)STATUS_SUCCESS;
         break;
+
+    case VMCALL_INVEPT:
+        regs->rax = ept_invept_single(vcpu)
+            ? (UINT64)STATUS_SUCCESS
+            : (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+
+    case VMCALL_CONCEAL_COMMIT:
+        if (root_transport_conceal_commit_allowed() &&
+            ept_conceal_commit_local(vcpu) &&
+            root_transport_conceal_ack(vcpu))
+            regs->rax = (UINT64)STATUS_SUCCESS;
+        else
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+        break;
+
+    case VMCALL_PROTECT_REFRESH:
+    {
+        UINT64 cr3 = 0;
+        if (!vmx_vmread_checked(vcpu, VMCS_GUEST_CR3, &cr3))
+        {
+            regs->rax = (UINT64)STATUS_UNSUCCESSFUL;
+            break;
+        }
+        protect_on_cr3_load(vcpu, cr3);
+        vcpu->protect_cr3_exiting =
+            protect_requires_cr3_exiting();
+        if (!vcpu->terminal && !vmexit_sync_dynamic_exiting(vcpu))
+            vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
+        regs->rax = vcpu->terminal
+            ? (UINT64)STATUS_UNSUCCESSFUL
+            : (UINT64)STATUS_SUCCESS;
+        break;
+    }
 
     case VMCALL_VMXOFF:
     {
         UINT64 instr_len = 0;
         __vmx_vmread(VMCS_VMEXIT_INSTRUCTION_LENGTH, &instr_len);
-        regs->rax = (UINT64)STATUS_SUCCESS;
-        vmexit_leave_vmx(vcpu, vcpu->vmexit_rip + instr_len, FALSE);
+        regs->rax = vmexit_leave_vmx(
+            vcpu,
+            vcpu->vmexit_rip + instr_len,
+            FALSE)
+            ? (UINT64)STATUS_SUCCESS
+            : (UINT64)STATUS_UNSUCCESSFUL;
         break;
     }
 
@@ -988,10 +1260,37 @@ vmexit_enter_terminal(
     VIRTUAL_MACHINE_STATE * vcpu,
     UINT32 failure)
 {
+    UINT64 cs_ar = 0;
+
     vcpu->failed = TRUE;
     vcpu->terminal = TRUE;
     vcpu->last_failure = failure;
     vcpu->advance_rip = FALSE;
+
+    /*
+    * Kernel-mode terminal exits can fall back to bare metal on the existing
+    * kernel stack.  A failed internal VMCALL must be skipped after VMXOFF;
+    * retrying VMCALL with VMXE cleared would raise #UD in the DPC.
+    */
+    if (vcpu->vmxon_active &&
+        vmx_vmread_checked(
+            vcpu, VMCS_GUEST_CS_ACCESS_RIGHTS, &cs_ar) &&
+        (((cs_ar >> 5) & 3) == 0))
+    {
+        UINT64 return_rip = vcpu->vmexit_rip;
+        if (vcpu->exit_reason ==
+            VMX_EXIT_REASON_EXECUTE_VMCALL)
+        {
+            UINT64 length = 0;
+            __vmx_vmread(
+                VMCS_VMEXIT_INSTRUCTION_LENGTH,
+                &length);
+            return_rip += length;
+        }
+        vmexit_leave_vmx(vcpu, return_rip, FALSE);
+        return;
+    }
+
     vmx_vmwrite_checked(
         vcpu,
         VMCS_CTRL_VMENTRY_INTERRUPTION_INFORMATION_FIELD,
@@ -1180,6 +1479,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     if (exit_reason < HV_STATUS_EXIT_REASON_COUNT)
         vcpu->exit_counters[exit_reason]++;
 
+    if (!vmx_vmread_checked(vcpu, VMCS_GUEST_RIP, &vcpu->vmexit_rip) ||
+        !vmx_vmread_checked(vcpu, VMCS_GUEST_RSP, &vcpu->regs->rsp) ||
+        !vmx_vmread_checked(vcpu, VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual))
+    {
+        vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
+        return FALSE;
+    }
+
     //
     // conditional per-exit sampling (see vmexit_exit_sample_plan). the DR
     // shadow is additionally sampled whenever guest debugging is live —
@@ -1224,10 +1531,14 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->guest_dr3 = __readdr(3);
         vcpu->guest_dr6 = __readdr(6);
     }
-    // A different exit can preempt the MTF retry window. Fail closed and
-    // let the original MMIO instruction fault/re-arm when it is retried.
-    if (vcpu->mtf_hook &&
-        exit_reason != VMX_EXIT_REASON_MONITOR_TRAP_FLAG)
+    // Keep prior grants across additional protected-page EPT violations from
+    // the same instruction; MTF restores the complete bounded set only after
+    // the instruction retires.  Other exits fail closed and restore now.
+    if ((vcpu->mtf_hook || protect_mtf_pending(vcpu)) &&
+        exit_reason != VMX_EXIT_REASON_MONITOR_TRAP_FLAG &&
+        !(protect_mtf_pending(vcpu) &&
+          !vcpu->mtf_hook &&
+          exit_reason == VMX_EXIT_REASON_EPT_VIOLATION))
     {
         ept_handle_monitor_trap(vcpu);
         if (vcpu->terminal)
@@ -1258,12 +1569,11 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->root_tsc_bias = 0;
         vcpu->lapic_root_bias = 0;
 
-        if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
+        if (!vmexit_sync_dynamic_exiting(vcpu))
         {
-            size_t proc_ctrl = 0;
-            __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
-            proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
-            __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+            vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
+            vcpu->in_root = FALSE;
+            return vcpu->vmxoff.executed;
         }
     }
 #endif
@@ -1280,14 +1590,6 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vcpu->lapic_root_bias = 0;
     }
 
-    if (!vmx_vmread_checked(vcpu, VMCS_GUEST_RIP, &vcpu->vmexit_rip) ||
-        !vmx_vmread_checked(vcpu, VMCS_GUEST_RSP, &vcpu->regs->rsp) ||
-        !vmx_vmread_checked(vcpu, VMCS_EXIT_QUALIFICATION, &vcpu->exit_qual))
-    {
-        vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_READ);
-        return FALSE;
-    }
-
     switch (exit_reason)
     {
     case VMX_EXIT_REASON_TRIPLE_FAULT:
@@ -1300,15 +1602,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         break;
 
 
-    case VMX_EXIT_REASON_EXECUTE_VMXON:
-        // Cleanly leave Ophion and retry this VMXON against the underlying
-        // hardware/L0. This is a deliberate handoff, not nested-VMCS emulation.
-        vmexit_leave_vmx(vcpu, vcpu->vmexit_rip, TRUE);
-        break;
-
     //
     // VMX instructions in guest — inject #UD (bare metal behavior)
     //
+    case VMX_EXIT_REASON_EXECUTE_VMXON:
     case VMX_EXIT_REASON_EXECUTE_VMCLEAR:
     case VMX_EXIT_REASON_EXECUTE_VMPTRLD:
     case VMX_EXIT_REASON_EXECUTE_VMPTRST:
@@ -1412,25 +1709,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
-            if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
-            {
-                UINT64 proc_ctrl = 0;
-                if (!vmx_vmread_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        &proc_ctrl) ||
-                    !vmx_vmwrite_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        proc_ctrl &
-                            ~(UINT64)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
-                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
-            }
+            if (!vmexit_sync_dynamic_exiting(vcpu))
+                vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
         }
         else
 #endif
         {
-            tsc = (UINT64)((INT64)tsc + (INT64)offset_raw);
+            tsc = (UINT64)((INT64)vcpu->root_tsc_entry + (INT64)offset_raw);
         }
 
         if (tsc <= vcpu->tsc_last_value)
@@ -1475,20 +1760,8 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
             vcpu->lapic_root_bias = 0;
             vcpu->timer_bias_pending = TRUE;
 
-            if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
-            {
-                UINT64 proc_ctrl = 0;
-                if (!vmx_vmread_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        &proc_ctrl) ||
-                    !vmx_vmwrite_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        proc_ctrl |
-                            CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
-                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
-            }
+            if (!vmexit_sync_dynamic_exiting(vcpu))
+                vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
         }
 #endif
         break;
@@ -1767,25 +2040,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
 
             vcpu->tsc_rdtsc_armed = FALSE;
 
-            if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
-            {
-                UINT64 proc_ctrl = 0;
-                if (!vmx_vmread_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        &proc_ctrl) ||
-                    !vmx_vmwrite_checked(
-                        vcpu,
-                        VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS,
-                        proc_ctrl &
-                            ~(UINT64)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING))
-                    vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
-            }
+            if (!vmexit_sync_dynamic_exiting(vcpu))
+                vmexit_enter_terminal(vcpu, HV_FAILURE_VMCS_WRITE);
         }
         else
 #endif
         {
-            tsc = (UINT64)((INT64)tsc + (INT64)offset_raw);
+            tsc = (UINT64)((INT64)vcpu->root_tsc_entry + (INT64)offset_raw);
         }
 
         if (tsc <= vcpu->tsc_last_value)
@@ -1806,6 +2067,13 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         vmexit_enter_terminal(vcpu, HV_FAILURE_UNKNOWN_EXIT);
         break;
     }
+
+    if (vcpu->terminal && !vcpu->vmxoff.executed)
+        vmexit_enter_terminal(
+            vcpu,
+            vcpu->last_failure
+                ? vcpu->last_failure
+                : HV_FAILURE_UNKNOWN_EXIT);
 
     //
     // re-inject IDT vectoring event if one was in progress during this VM-exit.

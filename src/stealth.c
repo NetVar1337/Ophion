@@ -91,6 +91,8 @@ stealth_init_cpuid_cache(VOID)
         }
 
         g_stealth_cpuid_cache.bare_metal_cpuid_cost = best;
+        g_stealth_cpuid_cache.bare_metal_fyl2xp1_cost = 0;
+
     }
 
     //

@@ -5,6 +5,8 @@ PUBLIC asm_host_nmi_handler
 PUBLIC asm_host_df_handler
 PUBLIC asm_host_gp_handler
 PUBLIC asm_host_default_handler
+EXTERN g_vmxoff_transition_count:DWORD
+EXTERN g_vmxoff_nmi_deferred:DWORD
 
 
 .code _text
@@ -17,6 +19,13 @@ asm_host_nmi_handler PROC
 
     push    rax
     push    rcx
+    cmp     dword ptr [g_vmxoff_transition_count], 0
+    je      HostNmiVmcs
+    lock inc dword ptr [g_vmxoff_nmi_deferred]
+    jmp     HostNmiDone
+
+HostNmiVmcs:
+
 
     mov     ecx, 06C14h           ; VMCS_HOST_RSP
     vmread  rax, rcx

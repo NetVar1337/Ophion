@@ -64,13 +64,6 @@ vmx_preflight(VOID)
         return FALSE;
 
     __cpuid((int *)&data, CPUID_PROCESSOR_FEATURES);
-    if (!(data.ecx & (1U << CPUID_VMX_BIT)) ||
-        !vmx_check_support())
-    {
-        g_hv_capabilities.Failure = HV_FAILURE_VMX_UNAVAILABLE;
-        return FALSE;
-    }
-
     if (data.ecx & HYPERV_HYPERVISOR_PRESENT_BIT)
     {
         g_hv_capabilities.ParentFlags |= HV_PARENT_PRESENT;
@@ -87,6 +80,18 @@ vmx_preflight(VOID)
                 g_hv_capabilities.ParentFeatures = (UINT32)cpu_info[0];
             }
         }
+#if !OPHION_ALLOW_NESTED
+        g_hv_capabilities.ParentFlags |= HV_PARENT_NESTED_RESTRICTED;
+        g_hv_capabilities.Failure = HV_FAILURE_NESTED_RESTRICTION;
+        return FALSE;
+#endif
+    }
+
+    if (!(data.ecx & (1U << CPUID_VMX_BIT)) ||
+        !vmx_check_support())
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_VMX_UNAVAILABLE;
+        return FALSE;
     }
 
     __cpuidex(cpu_info, (INT32)0x80000000, 0);
@@ -485,6 +490,10 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, pri_proc);
 
+    vcpu->primary_dynamic_forced =
+        pri_proc &
+        (CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING |
+         CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING);
     vcpu->mov_dr_exiting = !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING);
     vcpu->guest_cr8 = (UINT8)__readcr8();
 
@@ -510,15 +519,25 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
         IA32_VMX_PROCBASED_CTLS2);
     if (!(sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_EPT))
         return FALSE;
-
+    vcpu->vpid_enabled =
+        (sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_VPID) != 0;
+    if (vcpu->vpid_enabled &&
+        (!g_ept->invvpid_supported ||
+         !g_ept->invvpid_single_context))
+        return FALSE;
     vcpu->waitpkg_enabled =
         ((sec_proc & CPU_BASED_VM_EXEC_CTRL2_ENABLE_USER_WAIT_PAUSE) != 0);
     __vmx_vmwrite(VMCS_CTRL_SECONDARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, sec_proc);
 
     pin_ctrl = vmx_adjust_controls(
-        PIN_BASED_VM_EXEC_CTRL_NMI_EXITING,
-        vmx_basic.VmxControls ? IA32_VMX_TRUE_PINBASED_CTLS : IA32_VMX_PINBASED_CTLS);
-
+        PIN_BASED_VM_EXEC_CTRL_NMI_EXITING |
+        PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI,
+        vmx_basic.VmxControls
+            ? IA32_VMX_TRUE_PINBASED_CTLS
+            : IA32_VMX_PINBASED_CTLS);
+    if (!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_NMI_EXITING) ||
+        !(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_VIRTUAL_NMI))
+        return FALSE;
     __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin_ctrl);
 
     HV_LOG(0, 0, "[hv] Pin controls: 0x%08X (ExtInt=%d NMI=%d VirtNMI=%d Preempt=%d)\n",
@@ -542,7 +561,9 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     exit_ctrl = vmx_adjust_controls(
         VM_EXIT_CTRL_HOST_ADDRESS_SPACE_SIZE |
         VM_EXIT_CTRL_SAVE_DEBUG_CONTROLS |
-        VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT |
+        ((pin_ctrl & PIN_BASED_VM_EXEC_CTRL_EXTERNAL_INTERRUPT_EXITING)
+            ? VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT
+            : 0) |
         (vcpu->pmu_gp_count
             ? VM_EXIT_CTRL_LOAD_IA32_PERF_GLOBAL_CTRL |
               VM_EXIT_CTRL_SAVE_IA32_PERF_GLOBAL_CTRL
@@ -727,6 +748,9 @@ vmx_virtualize_cpu(PVOID guest_stack)
     vcpu = &g_vcpu[core];
     vcpu->core_id = core;
     vmx_calibrate_cpuid(vcpu);
+    vcpu->original_cr0 = __readcr0();
+    vcpu->original_cr4 = __readcr4();
+
 
     asm_enable_vmx();
     vmx_set_fixed_bits();
@@ -735,6 +759,8 @@ vmx_virtualize_cpu(PVOID guest_stack)
     {
         vcpu->failed = TRUE;
         vcpu->last_failure = HV_FAILURE_VM_ENTRY;
+        __writecr0(vcpu->original_cr0);
+        __writecr4(vcpu->original_cr4 & ~CR4_VMX_ENABLE_FLAG);
         HV_LOG(0, 0, "[hv] VMXON failed on core %u\n", core);
         return FALSE;
     }
@@ -747,9 +773,11 @@ vmx_virtualize_cpu(PVOID guest_stack)
         vcpu->failed = TRUE;
         if (!vcpu->last_failure)
             vcpu->last_failure = HV_FAILURE_VMCS_WRITE;
-        HV_LOG(0, 0, "[hv] VMCS setup failed on core %u\n", core);
-        __vmx_off();
-        vcpu->vmxon_active = FALSE;
+        if (asm_vmxoff_checked() == 0)
+        {
+            __writecr0(vcpu->original_cr0);
+            __writecr4(vcpu->original_cr4 & ~CR4_VMX_ENABLE_FLAG);
+        }
         return FALSE;
     }
 
@@ -761,8 +789,11 @@ vmx_virtualize_cpu(PVOID guest_stack)
     vcpu->last_failure = HV_FAILURE_VM_ENTRY;
     if (__vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code) == 0)
         vcpu->last_vm_instruction_error = (UINT32)error_code;
-    __vmx_off();
-    vcpu->vmxon_active = FALSE;
+    if (asm_vmxoff_checked() == 0)
+    {
+        __writecr0(vcpu->original_cr0);
+        __writecr4(vcpu->original_cr4 & ~CR4_VMX_ENABLE_FLAG);
+    }
 
     HV_LOG(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
     return FALSE;
@@ -778,7 +809,8 @@ vmx_vmresume(VOID)
     //
     UINT64 error_code = 0;
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
-    __vmx_off();
+    if (asm_vmxoff_checked() == 0)
+        __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
     HV_LOG(0, 0, "[hv] VMRESUME failed! Error: 0x%llx\n", error_code);
     __debugbreak();
     for (;;)
@@ -928,6 +960,20 @@ vmx_init(VOID)
         return FALSE;
     }
 
+    protect_init();
+
+    /*
+     * Capture and allocate every per-core host GDT before cloning the host
+     * page tables or freezing the conceal manifest.  vmx_setup_vmcs() runs
+     * on the same core later and only validates/reuses this allocation.
+     */
+    if (!broadcast_prepare_host_state())
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_ALLOCATION;
+        HV_LOG(0, 0, "[hv] Per-core host GDT preparation failed!\n");
+        return FALSE;
+    }
+
     //
     // build private host page tables AFTER all allocations are done.
     // The snapshot must include PTEs for VMM stacks, bitmaps, and all
@@ -954,6 +1000,24 @@ vmx_init(VOID)
     }
 #endif
 
+    if (!root_transport_snapshot_metadata())
+    {
+        g_hv_capabilities.Failure = HV_FAILURE_ALLOCATION;
+        return FALSE;
+    }
+
+#if STEALTH_CONCEAL_HOST_PAGES
+    if (g_stealth_enabled &&
+        !ept_conceal_prepare())
+    {
+        HV_LOG(
+            0, 0,
+            "[hv] Conceal manifest preparation failed: %u\n",
+            g_hv_capabilities.Failure);
+        return FALSE;
+    }
+#endif
+
     broadcast_virtualize_all();
 
     for (UINT32 i = 0; i < g_cpu_count; i++)
@@ -961,27 +1025,93 @@ vmx_init(VOID)
         if (!g_vcpu[i].launched)
         {
             HV_LOG(0, 0, "[hv] Core %u failed to launch; rolling back launched cores.\n", i);
-            broadcast_terminate_all();
+            broadcast_terminate_initializing(FALSE);
             return FALSE;
         }
     }
 
     HV_LOG(0, 0, "[hv] All %u cores virtualized successfully!\n", g_cpu_count);
+    if (!root_transport_mark_awaiting_bootstrap())
+    {
+        g_hv_capabilities.Failure =
+            HV_FAILURE_REQUIRED_CONTROLS;
+        broadcast_terminate_initializing(TRUE);
+        return FALSE;
+    }
+#if STEALTH_CONCEAL_HOST_PAGES
+    if (g_stealth_enabled)
+    {
+        if (!broadcast_conceal_invept())
+        {
+            HV_LOG(0, 0, "[hv] Conceal INVEPT failed\n");
+            broadcast_terminate_initializing(TRUE);
+            return FALSE;
+        }
+    }
+
+    eac_stealth_apply();
+#endif
+
+    return TRUE;
+}
+
+BOOLEAN
+vmx_all_stopped(VOID)
+{
+    VIRTUAL_MACHINE_STATE * vcpu_base =
+        root_transport_vcpu_base();
+    UINT32 processor_count =
+        root_transport_processor_count();
+    UINT32 i;
+
+    if (!vcpu_base)
+    {
+        vcpu_base = g_vcpu;
+        processor_count = g_cpu_count;
+    }
+    if (!vcpu_base)
+        return TRUE;
+    for (i = 0; i < processor_count; i++)
+    {
+        if (vcpu_base[i].vmxon_active ||
+            vcpu_base[i].launched ||
+            vcpu_base[i].in_root)
+            return FALSE;
+    }
     return TRUE;
 }
 
 VOID
 vmx_terminate(VOID)
 {
-    if (!g_vcpu)
+    VIRTUAL_MACHINE_STATE * vcpu_base =
+        root_transport_vcpu_base();
+    UINT32 processor_count =
+        root_transport_processor_count();
+
+    if (!vcpu_base)
+    {
+        vcpu_base = g_vcpu;
+        processor_count = g_cpu_count;
+    }
+    if (!vcpu_base)
         return;
+    if (!vmx_all_stopped())
+    {
+        HV_LOG(0, 0,
+            "[hv] Refusing to free live VMX resources; a vCPU is still active\n");
+        return;
+    }
+
 
     ept_destroy_timer_hooks();
+    ept_conceal_destroy();
+
     ept_destroy_splits();
 
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < processor_count; i++)
     {
-        VIRTUAL_MACHINE_STATE * vcpu = &g_vcpu[i];
+        VIRTUAL_MACHINE_STATE * vcpu = &vcpu_base[i];
 
         //
         // free per-VCPU resources.
@@ -1003,14 +1133,16 @@ vmx_terminate(VOID)
             ExFreePoolWithTag((PVOID)vcpu->io_bitmap_va_b, HV_POOL_TAG);
     }
 
+    protect_destroy();
+
     if (g_ept)
     {
-        for (UINT32 i = 0; i < g_cpu_count; i++)
+        for (UINT32 i = 0; i < processor_count; i++)
         {
-            if (g_vcpu[i].ept_page_table)
-                MmFreeContiguousMemory(g_vcpu[i].ept_page_table);
+            if (vcpu_base[i].ept_page_table)
+                MmFreeContiguousMemory(vcpu_base[i].ept_page_table);
         }
-        ExFreePoolWithTag(g_ept, HV_POOL_TAG);
+        MmFreeContiguousMemory(g_ept);
         g_ept = NULL;
     }
 
@@ -1023,14 +1155,15 @@ vmx_terminate(VOID)
 #endif
 
 #if USE_PRIVATE_HOST_GDT
-    for (UINT32 i = 0; i < g_cpu_count; i++)
+    for (UINT32 i = 0; i < processor_count; i++)
     {
-        hostgdt_destroy_for_vcpu(&g_vcpu[i]);
+        hostgdt_destroy_for_vcpu(&vcpu_base[i]);
     }
 #endif
 
-    ExFreePoolWithTag(g_vcpu, HV_POOL_TAG);
+    ExFreePoolWithTag(vcpu_base, HV_POOL_TAG);
     g_vcpu = NULL;
+    root_transport_release_metadata();
 
     HV_LOG(0, 0, "[hv] VMX terminated on all cores.\n");
 }
