@@ -5,9 +5,6 @@
 */
 #include "hv.h"
 
-#define DEVICE_NAME     L"\\Device\\Ophion"
-#define SYMLINK_NAME    L"\\DosDevices\\Ophion"
-
 #define IOCTL_BASE      0x800
 //
 // status query only reads from the device, so require read access
@@ -24,6 +21,12 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 
     HV_LOG("[hv] Unloading hypervisor driver...\n");
 
+    //
+    // restore the hidden device object + symlink first, so the
+    // IoDeleteSymbolicLink/IoDeleteDevice below work normally
+    //
+    dkom_restore();
+
     broadcast_terminate_all();
     vmx_terminate();
 
@@ -34,6 +37,8 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
     {
         IoDeleteDevice(driver_obj->DeviceObject);
     }
+
+    dkom_cleanup();
 
     HV_LOG("[hv] Driver unloaded.\n");
 }
@@ -86,6 +91,18 @@ DriverEntry(
         return status;
     }
 
+    //
+    // allocate the relocated globals before vmx_init(): stealth_init and
+    // hostcr3_build must already see this allocation
+    //
+    if (!dkom_alloc_globals())
+    {
+        HV_LOG("[hv] Failed to allocate relocated globals\n");
+        IoDeleteSymbolicLink(&symlink);
+        IoDeleteDevice(device_obj);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     driver_obj->DriverUnload                         = DriverUnload;
     driver_obj->MajorFunction[IRP_MJ_CREATE]         = DriverCreateClose;
     driver_obj->MajorFunction[IRP_MJ_CLOSE]          = DriverCreateClose;
@@ -97,8 +114,15 @@ DriverEntry(
         vmx_terminate();  // clean up any partially-allocated resources
         IoDeleteSymbolicLink(&symlink);
         IoDeleteDevice(device_obj);
+        dkom_cleanup();
         return STATUS_HV_OPERATION_FAILED;
     }
+
+    //
+    // PG-safe DKOM: hide device object + symlink, wipe on-disk image
+    // (runs in guest context, so it must not touch the EPT-hidden globals)
+    //
+    dkom_hide(driver_obj);
 
     HV_LOG("[hv] Hypervisor loaded and active on all cores!\n");
     return STATUS_SUCCESS;

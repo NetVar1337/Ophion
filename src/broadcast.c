@@ -63,8 +63,10 @@ dpc_terminate_guest(
     // only cores that successfully launched are in VMX non-root mode.
     // VMCALL on a core that never entered VMX operation would #UD,
     // so skip those (e.g. when rolling back a partial launch failure).
+    // g_core_launched is used instead of g_vcpu[core].launched because this
+    // DPC runs in VMX non-root, where the EPT decoy hides the g_vcpu pages.
     //
-    if (g_vcpu && core < g_cpu_count && g_vcpu[core].launched)
+    if (g_vcpu && core < g_cpu_count && g_core_launched[core])
     {
         asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
     }
