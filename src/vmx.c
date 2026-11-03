@@ -613,6 +613,25 @@ vmx_init(VOID)
             ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
         }
 
+#if STEALTH_HIDE_INTEL_PT
+        //
+        // Intel PT (RTIT) MSRs 0x560-0x58F read+write.
+        // the handler injects #GP, matching a CPU without PT
+        // (consistent with CPUID.7.0:EBX[25] being cleared)
+        //
+        for (UINT32 msr_idx = IA32_RTIT_MSR_FIRST; msr_idx <= IA32_RTIT_MSR_LAST; msr_idx++)
+        {
+            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+        }
+#endif
+
+#if STEALTH_MASK_LBR_BTF
+        // IA32_DEBUGCTL (0x1D9) read+write - handler masks LBR/BTF
+        ((PUCHAR)vcpu->msr_bitmap_va)[IA32_DEBUGCTL / 8] |= (UCHAR)(1 << (IA32_DEBUGCTL % 8));
+        ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + IA32_DEBUGCTL / 8] |= (UCHAR)(1 << (IA32_DEBUGCTL % 8));
+#endif
+
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
 

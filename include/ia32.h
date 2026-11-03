@@ -31,6 +31,13 @@
 
 #define IA32_FEATURE_CONTROL           0x0000003A
 #define IA32_DEBUGCTL                  0x000001D9
+
+//
+// Intel PT (RTIT) MSRs, hidden under STEALTH_HIDE_INTEL_PT.
+// 0x560 = IA32_RTIT_OUTPUT_BASE ... 0x570 = IA32_RTIT_CTL ... 0x58F
+//
+#define IA32_RTIT_MSR_FIRST            0x00000560
+#define IA32_RTIT_MSR_LAST             0x0000058F
 #define IA32_SYSENTER_CS               0x00000174
 #define IA32_SYSENTER_ESP              0x00000175
 #define IA32_SYSENTER_EIP              0x00000176
@@ -1104,6 +1111,7 @@ typedef union _VMENTRY_INTERRUPT_INFORMATION {
 #define PENDING_DEBUG_BS        (1ULL << 14)
 
 #define RFLAGS_TF               (1ULL << 8)
+#define DEBUGCTL_LBR            (1ULL << 0)
 #define DEBUGCTL_BTF            (1ULL << 1)
 
 //

@@ -210,6 +210,28 @@ vmexit_handle_cpuid(VIRTUAL_MACHINE_STATE * vcpu)
         {
             cpu_info[2] &= ~((1 << 31) | (1 << 6));
         }
+
+#if STEALTH_HIDE_INTEL_PT
+        //
+        // leaf 7 subleaf 0: clear the Intel PT bit (EBX[25])
+        //
+        if (leaf == 7 && subleaf == 0 && g_stealth_enabled)
+        {
+            cpu_info[1] &= ~(1 << 25);
+        }
+
+        //
+        // leaf 0x14 (PT capabilities): with the PT bit cleared this leaf
+        // must read as all zeros, like on a CPU without PT
+        //
+        if (leaf == 0x14 && g_stealth_enabled)
+        {
+            cpu_info[0] = 0;
+            cpu_info[1] = 0;
+            cpu_info[2] = 0;
+            cpu_info[3] = 0;
+        }
+#endif
     }
 
     regs->rax = (UINT64)cpu_info[0];
@@ -296,23 +318,29 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
 
         case IA32_FEATURE_CONTROL:
         {
-            IA32_FEATURE_CONTROL_REGISTER feat = {0};
-            feat.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
-
-            if (g_stealth_enabled)
-            {
-                feat.Lock                      = 1;
-                feat.EnableVmxInsideSmx        = 0;
-                feat.EnableVmxOutsideSmx       = 0;
-                feat.SenterLocalFunctionEnables = 0;
-                feat.SenterGlobalEnable        = 0;
-                feat.SgxLaunchControlEnable    = 0;
-                feat.SgxGlobalEnable           = 0;
-            }
-
-            msr.Flags = feat.AsUInt;
+            //
+            // return the real hardware value: the hypervisor itself requires
+            // VMX outside SMX enabled, so bare metal has Lock=1 and
+            // EnableVmxOutsideSmx=1 - masking them would be detectable
+            //
+            msr.Flags = __readmsr(IA32_FEATURE_CONTROL);
             break;
         }
+
+#if STEALTH_MASK_LBR_BTF
+        case IA32_DEBUGCTL:
+        {
+            //
+            // mask LBR/BTF so last-branch tracing cannot observe VM-exit
+            // transitions; reads stay consistent with the masked writes
+            //
+            UINT64 debugctl = __readmsr(IA32_DEBUGCTL);
+            if (g_stealth_enabled)
+                debugctl &= ~(DEBUGCTL_LBR | DEBUGCTL_BTF);
+            msr.Flags = debugctl;
+            break;
+        }
+#endif
 
         default:
             //
@@ -400,10 +428,25 @@ vmexit_handle_msr_write(VIRTUAL_MACHINE_STATE * vcpu)
             __vmx_vmwrite(VMCS_GUEST_FS_BASE, msr.Flags);
             break;
 
+#if STEALTH_MASK_LBR_BTF
+        case IA32_DEBUGCTL:
+        {
+            //
+            // strip LBR/BTF, forward the rest (architectural MSR, safe in
+            // VMX-root) so guest read-back stays consistent with bare metal
+            //
+            if (g_stealth_enabled)
+                msr.Flags &= ~(DEBUGCTL_LBR | DEBUGCTL_BTF);
+            __writemsr(IA32_DEBUGCTL, msr.Flags);
+            break;
+        }
+#endif
+
         default:
             //
-            // unhandled — never forward to hardware in VMX-root, would #GP
-            // and hit our private IDT halt handler. inject #GP(0) to guest.
+            // unhandled (incl. RTIT MSRs when PT is hidden) — never forward
+            // to hardware in VMX-root, would #GP and hit our private IDT
+            // halt handler. inject #GP(0) to guest.
             //
             vmexit_inject_gp();
             vcpu->advance_rip = FALSE;
