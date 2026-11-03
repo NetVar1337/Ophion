@@ -35,6 +35,8 @@ UINT64 get_system_cr3(VOID);
 BOOLEAN hostcr3_build(VOID);
 UINT64  hostcr3_get(VOID);
 VOID    hostcr3_destroy(VOID);
+UINT32  hostcr3_get_pt_page_count(VOID);
+UINT64  hostcr3_get_pt_page_pa(UINT32 index);
 
 //
 // private host IDT (hostidt.c)
@@ -84,6 +86,10 @@ BOOLEAN ept_setup_pml2(PVMM_EPT_PAGE_TABLE page_table, PEPT_PML2_ENTRY new_entry
 PEPT_PML1_ENTRY ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 PEPT_PML2_ENTRY ept_get_pml2(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
 BOOLEAN ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr);
+
+BOOLEAN ept_hide_page(PVMM_EPT_PAGE_TABLE page_table, UINT64 phys_addr, UINT64 decoy_pa);
+BOOLEAN ept_hide_range(PVMM_EPT_PAGE_TABLE page_table, UINT64 start_pa, UINT64 length, UINT64 decoy_pa);
+BOOLEAN ept_hide_vmm_pages(VOID);
 
 VOID ept_invept_single(EPT_POINTER ept_ptr);
 VOID ept_invept_all(VOID);

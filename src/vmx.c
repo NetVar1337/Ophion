@@ -696,6 +696,20 @@ vmx_init(VOID)
     }
 #endif
 
+#if STEALTH_HIDE_VMM_PAGES
+    //
+    // hide VMM physical pages from guest memory scans: repoint their EPT
+    // entries at a decoy zero page. host mode uses HOST_CR3, not the EPT,
+    // so the hypervisor itself is unaffected. runs before the first
+    // VMLAUNCH so no stale EPT translations exist for these EPTPs.
+    //
+    if (!ept_hide_vmm_pages())
+    {
+        HV_LOG("[hv] Failed to hide VMM pages in EPT!\n");
+        return FALSE;
+    }
+#endif
+
     broadcast_virtualize_all();
 
     //
@@ -762,6 +776,8 @@ vmx_terminate(VOID)
             if (g_vcpu[i].ept_page_table)
                 MmFreeContiguousMemory(g_vcpu[i].ept_page_table);
         }
+        if (g_ept->decoy_va)
+            ExFreePoolWithTag((PVOID)g_ept->decoy_va, HV_POOL_TAG);
         ExFreePoolWithTag(g_ept, HV_POOL_TAG);
         g_ept = NULL;
     }

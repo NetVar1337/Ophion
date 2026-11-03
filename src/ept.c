@@ -380,6 +380,11 @@ ept_split_large_page(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
 
     RtlCopyMemory(target, &new_ptr, sizeof(new_ptr));
 
+    //
+    // track the split so ept_hide_vmm_pages() can hide the pml1 page itself
+    //
+    InsertTailList(&g_ept->hooked_pages, &new_split->SplitList);
+
     return TRUE;
 }
 
@@ -421,6 +426,174 @@ ept_get_pml1(PVMM_EPT_PAGE_TABLE page_table, SIZE_T phys_addr)
         return NULL;
 
     return &pml1[ADDRMASK_EPT_PML1_INDEX(phys_addr)];
+}
+
+/*
+*   hide a single 4kb physical page from the guest by repointing its EPT
+*   entry at the decoy zero page. VMX-root is unaffected: host-mode memory
+*   accesses use HOST_CR3, not the EPT, and the CPU EPT walk itself uses
+*   the EPTP physical address directly.
+*/
+BOOLEAN
+ept_hide_page(PVMM_EPT_PAGE_TABLE page_table, UINT64 phys_addr, UINT64 decoy_pa)
+{
+    PEPT_PML2_ENTRY pml2 = ept_get_pml2(page_table, phys_addr);
+    if (!pml2)
+        return FALSE;
+
+    if (pml2->LargePage)
+    {
+        if (!ept_split_large_page(page_table, phys_addr))
+            return FALSE;
+    }
+
+    PEPT_PML1_ENTRY pml1 = ept_get_pml1(page_table, phys_addr);
+    if (!pml1)
+        return FALSE;
+
+    //
+    // only change the target PFN - keep the original access rights and
+    // memory type, so the mapping stays well-formed for the guest
+    //
+    pml1->PageFrameNumber = decoy_pa / PAGE_SIZE;
+    return TRUE;
+}
+
+BOOLEAN
+ept_hide_range(PVMM_EPT_PAGE_TABLE page_table, UINT64 start_pa, UINT64 length, UINT64 decoy_pa)
+{
+    UINT64 start = start_pa & ~(UINT64)(PAGE_SIZE - 1);
+    UINT64 end   = (start_pa + length + PAGE_SIZE - 1) & ~(UINT64)(PAGE_SIZE - 1);
+
+    for (UINT64 pa = start; pa < end; pa += PAGE_SIZE)
+    {
+        if (!ept_hide_page(page_table, pa, decoy_pa))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+/*
+*   hide every VMM structure in one vcpu's EPT: the vcpu array itself
+*   (holds vmxon/vmcs/ept pointers), the EPT state, and for every vcpu the
+*   VMXON/VMCS regions, VMM stack, MSR/I-O bitmaps and EPT page table,
+*   plus the private host PT pages and the decoy page.
+*/
+static BOOLEAN
+ept_hide_vmm_structures(PVMM_EPT_PAGE_TABLE page_table, UINT64 decoy_pa)
+{
+    if (!ept_hide_range(page_table, va_to_pa(g_vcpu),
+                        sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count, decoy_pa))
+        return FALSE;
+
+    if (!ept_hide_range(page_table, va_to_pa(g_ept), sizeof(EPT_STATE), decoy_pa))
+        return FALSE;
+
+    for (UINT32 j = 0; j < g_cpu_count; j++)
+    {
+        VIRTUAL_MACHINE_STATE * v = &g_vcpu[j];
+
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->vmxon_va), 2 * VMXON_SIZE + ALIGNMENT_PAGE_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->vmcs_va), 2 * VMCS_SIZE + ALIGNMENT_PAGE_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->vmm_stack), VMM_STACK_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->msr_bitmap_va), PAGE_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->io_bitmap_va_a), PAGE_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa((PVOID)v->io_bitmap_va_b), PAGE_SIZE, decoy_pa))
+            return FALSE;
+        if (!ept_hide_range(page_table, va_to_pa(v->ept_page_table), sizeof(VMM_EPT_PAGE_TABLE), decoy_pa))
+            return FALSE;
+    }
+
+#if USE_PRIVATE_HOST_CR3
+    for (UINT32 k = 0; k < hostcr3_get_pt_page_count(); k++)
+    {
+        UINT64 pa = hostcr3_get_pt_page_pa(k);
+        if (pa && !ept_hide_range(page_table, pa, PAGE_SIZE, decoy_pa))
+            return FALSE;
+    }
+#endif
+
+    //
+    // the decoy page maps to itself, so scans of it also read zeros
+    //
+    if (!ept_hide_range(page_table, decoy_pa, PAGE_SIZE, decoy_pa))
+        return FALSE;
+
+    return TRUE;
+}
+
+/*
+*   hide all VMM physical pages from guest memory scans.
+*   must run at PASSIVE_LEVEL after every VMM allocation (incl. private
+*   host PTs) and before the first VMLAUNCH, so no EPT translations for
+*   these EPTPs are cached yet.
+*/
+BOOLEAN
+ept_hide_vmm_pages(VOID)
+{
+    PUINT8 decoy;
+    UINT64 decoy_pa;
+
+    if (!g_ept || !g_vcpu)
+        return FALSE;
+
+    decoy = (PUINT8)ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HV_POOL_TAG);
+    if (!decoy)
+        return FALSE;
+    RtlZeroMemory(decoy, PAGE_SIZE);
+
+    g_ept->decoy_va = (UINT64)decoy;
+    decoy_pa        = va_to_pa(decoy);
+
+    //
+    // pass 1: hide all VMM structures in every vcpu's EPT (a scan from any
+    // core can read any GPA, so every EPT must hide every structure)
+    //
+    for (UINT32 i = 0; i < g_cpu_count; i++)
+    {
+        if (!g_vcpu[i].ept_page_table)
+            return FALSE;
+        if (!ept_hide_vmm_structures(g_vcpu[i].ept_page_table, decoy_pa))
+            return FALSE;
+    }
+
+    //
+    // pass 2: the 4kb splits created in pass 1 contain PML1 arrays full of
+    // the decoy PFN - a visible signature. hide those split structures too.
+    // splits created by this pass stay visible; one extra pass is enough
+    // in practice.
+    //
+    {
+        UINT32 splits_before = 0;
+        for (PLIST_ENTRY e = g_ept->hooked_pages.Flink; e != &g_ept->hooked_pages; e = e->Flink)
+            splits_before++;
+
+        UINT32 hidden = 0;
+        for (PLIST_ENTRY e = g_ept->hooked_pages.Flink;
+             e != &g_ept->hooked_pages && hidden < splits_before;
+             e = e->Flink, hidden++)
+        {
+            PVMM_EPT_DYNAMIC_SPLIT split =
+                CONTAINING_RECORD(e, VMM_EPT_DYNAMIC_SPLIT, SplitList);
+            UINT64 split_pa = va_to_pa(split);
+
+            for (UINT32 i = 0; i < g_cpu_count; i++)
+            {
+                if (!ept_hide_range(g_vcpu[i].ept_page_table, split_pa,
+                                    sizeof(VMM_EPT_DYNAMIC_SPLIT), decoy_pa))
+                    return FALSE;
+            }
+        }
+    }
+
+    HV_LOG("[hv] EPT: VMM pages hidden behind decoy PA 0x%llx\n", decoy_pa);
+    return TRUE;
 }
 
 VOID
