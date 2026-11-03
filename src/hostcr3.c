@@ -253,6 +253,20 @@ hostcr3_get(VOID)
     return g_host_pml4_pa;
 }
 
+UINT32
+hostcr3_get_pt_page_count(VOID)
+{
+    return g_host_pt_count;
+}
+
+UINT64
+hostcr3_get_pt_page_pa(UINT32 index)
+{
+    if (index >= g_host_pt_count)
+        return 0;
+    return va_to_pa(g_host_pt_pages[index]);
+}
+
 VOID
 hostcr3_destroy(VOID)
 {

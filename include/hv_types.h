@@ -75,7 +75,13 @@ typedef struct _EPT_STATE {
     UINT32                num_ranges;
     UINT8                 default_type;
     BOOLEAN               ad_supported;
-    LIST_ENTRY            hooked_pages;    // reserved for future EPT hooks
+    LIST_ENTRY            hooked_pages;    // tracks dynamic 4KB splits
+
+    //
+    // zero-filled decoy page: hidden VMM pages are repointed at this PFN
+    // in the guest EPT, so guest memory scans read zeros instead of VMM data
+    //
+    UINT64                decoy_va;
 
     //
     // INVVPID capability bits (cached from IA32_VMX_EPT_VPID_CAP)

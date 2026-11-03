@@ -39,6 +39,14 @@
 #define STEALTH_MASK_LBR_BTF                1
 
 //
+// hide the hypervisor's own physical pages (VMXON/VMCS regions, VMM
+// stacks, bitmaps, EPT tables, private host PTs) from guest memory
+// scans: their EPT entries are repointed at a decoy zero page.
+// VMX-root uses HOST_CR3, not the EPT, so host mode is unaffected.
+//
+#define STEALTH_HIDE_VMM_PAGES              1
+
+//
 // use cached bare-metal CPUID for invalid/hypervisor leaves
 // defeats: check_invalid_leaf, check_highest_low_function_leaf, VM::VMID
 //
