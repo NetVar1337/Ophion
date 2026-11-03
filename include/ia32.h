@@ -238,6 +238,14 @@ typedef struct _CPUID {
 #define CPUID_PROCESSOR_FEATURES            1
 #define HYPERV_HYPERVISOR_PRESENT_BIT       (1U << 31)
 
+//
+// CPUID.0 vendor string "GenuineIntel", returned in EBX/EDX/ECX
+// as little-endian dwords: "Genu" / "ineI" / "ntel"
+//
+#define CPUID_VENDOR_INTEL_EBX              0x756E6547
+#define CPUID_VENDOR_INTEL_EDX              0x49656E69
+#define CPUID_VENDOR_INTEL_ECX              0x6C65746E
+
 typedef union _CR0 {
     UINT64 AsUInt;
     struct {
