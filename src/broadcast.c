@@ -54,10 +54,20 @@ dpc_terminate_guest(
     _In_opt_ PVOID SystemArgument1,
     _In_opt_ PVOID SystemArgument2)
 {
+    ULONG core = KeGetCurrentProcessorNumberEx(NULL);
+
     UNREFERENCED_PARAMETER(Dpc);
     UNREFERENCED_PARAMETER(DeferredContext);
 
-    asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+    //
+    // only cores that successfully launched are in VMX non-root mode.
+    // VMCALL on a core that never entered VMX operation would #UD,
+    // so skip those (e.g. when rolling back a partial launch failure).
+    //
+    if (g_vcpu && core < g_cpu_count && g_vcpu[core].launched)
+    {
+        asm_vmx_vmcall(VMCALL_VMXOFF, 0, 0, 0);
+    }
 
     KeSignalCallDpcSynchronize(SystemArgument2);
     KeSignalCallDpcDone(SystemArgument1);

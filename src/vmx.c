@@ -19,22 +19,55 @@ vmx_get_cpu_id(VOID)
 BOOLEAN
 vmx_check_support(VOID)
 {
-    CPUID                         data              = {0};
+    CPUID                         data      = {0};
     IA32_FEATURE_CONTROL_REGISTER feat_ctrl = {0};
+
+    //
+    // CPUID.0 returns the vendor string in EBX/EDX/ECX.
+    // VMX is Intel-only: on AMD, CPUID.1:ECX[5] is the SVM bit and
+    // IA32_FEATURE_CONTROL (0x3A) is not implemented, so reading it
+    // below would #GP. reject non-Intel CPUs before touching any MSR.
+    //
+    __cpuid((int *)&data, 0);
+    if ((UINT32)data.ebx != CPUID_VENDOR_INTEL_EBX ||
+        (UINT32)data.edx != CPUID_VENDOR_INTEL_EDX ||
+        (UINT32)data.ecx != CPUID_VENDOR_INTEL_ECX)
+    {
+        DbgPrintEx(0, 0, "[hv] CPU vendor is not GenuineIntel - VMX not supported\n");
+        return FALSE;
+    }
 
     //
     // CPUID.1:ECX[5] = VMX support
     //
-    __cpuid((int *)&data, 1);
+    __cpuid((int *)&data, CPUID_PROCESSOR_FEATURES);
     if (!_bittest((const LONG *)&data.ecx, CPUID_VMX_BIT))
     {
+        DbgPrintEx(0, 0, "[hv] CPUID.1:ECX[5] clear - VMX not supported by this CPU\n");
         return FALSE;
+    }
+
+    //
+    // CPUID.1:ECX[31] = hypervisor present. VMXON may still work if the
+    // outer hypervisor exposes nested VMX, so only warn here; the
+    // FEATURE_CONTROL check below decides.
+    //
+    if (_bittest((const LONG *)&data.ecx, 31))
+    {
+        DbgPrintEx(0, 0, "[hv] Running under another hypervisor - nested VMX required\n");
     }
 
     feat_ctrl.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
 
-    if (feat_ctrl.EnableVmxOutsideSmx == FALSE)
+    if (!feat_ctrl.Lock)
     {
+        DbgPrintEx(0, 0, "[hv] IA32_FEATURE_CONTROL not locked - VMXON would fail\n");
+        return FALSE;
+    }
+
+    if (!feat_ctrl.EnableVmxOutsideSmx)
+    {
+        DbgPrintEx(0, 0, "[hv] IA32_FEATURE_CONTROL: VMX outside SMX disabled by BIOS\n");
         return FALSE;
     }
 
@@ -454,14 +487,20 @@ vmx_virtualize_cpu(PVOID guest_stack)
     if (__vmx_on(&vcpu->vmxon_pa))
     {
         DbgPrintEx(0, 0, "[hv] VMXON failed on core %u\n", core);
-        return FALSE;
+        goto fail;
     }
 
+    //
+    // vmx_clear_vmcs() issues VMXOFF itself on failure
+    //
     if (!vmx_clear_vmcs(vcpu))
-        return FALSE;
+        goto fail;
 
     if (!vmx_load_vmcs(vcpu))
-        return FALSE;
+    {
+        __vmx_off();
+        goto fail;
+    }
 
     vmx_setup_vmcs(vcpu, guest_stack);
 
@@ -477,6 +516,13 @@ vmx_virtualize_cpu(PVOID guest_stack)
     __vmx_off();
 
     DbgPrintEx(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
+
+fail:
+    //
+    // leave the core as we found it: clear CR4.VMXE so a failed core is
+    // not left with VMX enabled and no valid VMCS
+    //
+    __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
     return FALSE;
 }
 
@@ -498,6 +544,12 @@ vmx_vmresume(VOID)
 BOOLEAN
 vmx_init(VOID)
 {
+    //
+    // check CPU support before allocating anything
+    //
+    if (!vmx_check_support())
+        return FALSE;
+
     g_cpu_count = KeQueryActiveProcessorCount(0);
 
     g_vcpu = (VIRTUAL_MACHINE_STATE *)ExAllocatePool2(
@@ -507,12 +559,6 @@ vmx_init(VOID)
         return FALSE;
 
     RtlZeroMemory(g_vcpu, sizeof(VIRTUAL_MACHINE_STATE) * g_cpu_count);
-
-    if (!vmx_check_support())
-    {
-        DbgPrintEx(0, 0, "[hv] VMX not supported!\n");
-        return FALSE;
-    }
 
     //
     // initialize stealth CPUID cache — MUST be before VMXON
@@ -633,13 +679,27 @@ vmx_init(VOID)
 
     broadcast_virtualize_all();
 
+    //
+    // verify every core launched. if any core failed, roll back the cores
+    // that did launch (VMXOFF via DPC broadcast) before returning FALSE -
+    // otherwise the caller's vmx_terminate() would free VMCS regions and
+    // VMM stacks still in use by cores running in VMX root mode.
+    //
+    BOOLEAN all_launched = TRUE;
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {
         if (!g_vcpu[i].launched)
         {
             DbgPrintEx(0, 0, "[hv] Core %u failed to launch!\n", i);
-            return FALSE;
+            all_launched = FALSE;
         }
+    }
+
+    if (!all_launched)
+    {
+        DbgPrintEx(0, 0, "[hv] Partial launch failure - VMXOFF on all launched cores\n");
+        broadcast_terminate_all();
+        return FALSE;
     }
 
     DbgPrintEx(0, 0, "[hv] All %u cores virtualized successfully!\n", g_cpu_count);
