@@ -10,6 +10,7 @@ UINT64 g_system_cr3                         = 0;
 UINT64 *g_msr_bitmap_invalid                = NULL;
 volatile LONG g_host_nmi_pending[MAX_PROCESSORS] = {0};
 volatile LONG g_core_launched[MAX_PROCESSORS]    = {0};
+volatile UINT64 g_vmxoff_nonce                   = 0;
 
 DKOM_GLOBALS *g_dkom_globals                = NULL;
 DKOM_STATE    g_dkom_state                  = {0};

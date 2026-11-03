@@ -8,6 +8,7 @@
 extern VOID asm_host_nmi_handler(VOID);
 extern VOID asm_host_df_handler(VOID);
 extern VOID asm_host_gp_handler(VOID);
+extern VOID asm_host_pf_handler(VOID);
 extern VOID asm_host_default_handler(VOID);
 
 static VOID
@@ -60,6 +61,12 @@ hostidt_build(VOID)
     //
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_DF], (UINT64)asm_host_df_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
     hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_GP], (UINT64)asm_host_gp_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
+
+    //
+    // #PF: on-demand sync of the private host page tables (hostcr3_pf_sync),
+    // halts if not a missing kernel PML4 entry
+    //
+    hostidt_set_gate(&g_host_idt.idt[IDT_VECTOR_PF], (UINT64)asm_host_pf_handler, cs, IDT_TYPE_INTERRUPT_GATE, 0);
 
     g_host_idt.initialized = TRUE;
     return TRUE;

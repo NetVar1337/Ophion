@@ -171,6 +171,12 @@ hostcr3_build(VOID)
     UINT64 sys_cr3 = get_system_cr3();
     UINT64 pml4_pa = sys_cr3 & PTE_PFN_MASK;
 
+    //
+    // capture for the root-mode #PF sync (hostcr3_pf_sync) - reading the
+    // EPROCESS here is only safe at PASSIVE_LEVEL
+    //
+    g_system_cr3 = sys_cr3;
+
     PUINT64 orig_pml4 = host_map_phys(pml4_pa);
     if (!orig_pml4)
     {
@@ -265,6 +271,54 @@ hostcr3_get_pt_page_pa(UINT32 index)
     if (index >= g_host_pt_count)
         return 0;
     return va_to_pa(g_host_pt_pages[index]);
+}
+
+/*
+*   on-demand top-level sync for the private host page tables.
+*   called from the host-mode #PF handler (asm_host_pf_handler): if a
+*   kernel VA faulted in VMX-root because its PML4 entry was created in the
+*   system page tables after the snapshot was taken, copy the entry in and
+*   let the CPU retry. anything else returns FALSE and the handler halts.
+*
+*   note: the copied PML4E points at the system's PDPT (shared, read-only
+*   paging structure). acceptable because host mode only reads through it;
+*   full recursive on-demand copying is future work.
+*/
+BOOLEAN
+hostcr3_pf_sync(UINT64 cr2)
+{
+    UINT64  pml4_idx;
+    PUINT64 sys_pml4;
+    UINT64  sys_entry;
+
+    if (cr2 < 0xFFFF800000000000ULL)
+        return FALSE;                       // user-mode VA - not ours
+
+    pml4_idx = (cr2 >> 39) & 0x1FF;
+    if (pml4_idx < 256)
+        return FALSE;                       // user half of the address space
+
+    if (!g_host_pml4_va || !g_system_cr3)
+        return FALSE;
+
+    sys_pml4 = (PUINT64)host_map_phys(g_system_cr3 & PTE_PFN_MASK);
+    if (!sys_pml4)
+        return FALSE;
+
+    sys_entry = sys_pml4[pml4_idx];
+    if (!(sys_entry & PTE_PRESENT))
+        return FALSE;
+
+    {
+        PUINT64 our_pml4 = (PUINT64)g_host_pml4_va;
+        if (our_pml4[pml4_idx] & PTE_PRESENT)
+            return FALSE;                   // entry exists - fault was something else
+
+        our_pml4[pml4_idx] = sys_entry;
+    }
+
+    __invlpg((PVOID)cr2);
+    return TRUE;
 }
 
 VOID

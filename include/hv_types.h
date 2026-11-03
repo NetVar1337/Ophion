@@ -185,6 +185,13 @@ extern volatile LONG g_host_nmi_pending[MAX_PROCESSORS];
 //
 extern volatile LONG g_core_launched[MAX_PROCESSORS];
 
+//
+// per-boot nonce required in R13 for VMCALL_VMXOFF - any ring-0 code can
+// still execute VMCALL, but without the nonce it gets #UD instead of
+// tearing down VMX on a core
+//
+extern volatile UINT64 g_vmxoff_nonce;
+
 typedef struct _HOST_IDT_STATE {
     DECLSPEC_ALIGN(16) IDT_GATE_DESCRIPTOR_64 idt[IDT_NUM_ENTRIES];
     UINT64  original_idt_base;
