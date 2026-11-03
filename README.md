@@ -143,6 +143,8 @@ Defined in `include/stealth.h`:
 | `STEALTH_HIDE_CR4_VMXE` | 1 | Hide CR4.VMXE from guest via CR4 shadow |
 | `STEALTH_COMPENSATE_TIMING` | 1 | TSC compensation for RDTSC+CPUID+RDTSC timing attacks |
 | `STEALTH_CPUID_CACHING` | 1 | Cache native CPUID responses for invalid/hypervisor leaves |
+| `STEALTH_HIDE_INTEL_PT` | 1 | Hide Intel PT: clear CPUID.7.0:EBX[25], hide leaf 0x14, #GP on RTIT MSRs (0x560-0x58F) |
+| `STEALTH_MASK_LBR_BTF` | 1 | Mask LBR/BTF in IA32_DEBUGCTL so branch tracing can't see VM-exits |
 | `USE_PRIVATE_HOST_CR3` | 1 | Isolated host page tables (deep-copied kernel PTs) |
 | `USE_PRIVATE_HOST_IDT` | 1 | Isolated host IDT (prevents NMI hijacking in VMX-root) |
 | `USE_PRIVATE_HOST_GDT` | 1 | Per-core isolated host GDT |

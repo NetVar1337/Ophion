@@ -23,7 +23,20 @@
 // the VM-exit overhead, then RDTSC exiting is disabled. zero drift —
 // TSC_OFFSET is never modified, only one RDTSC per CPUID is trapped.
 //
-#define STEALTH_COMPENSATE_TIMING           0
+#define STEALTH_COMPENSATE_TIMING           1
+
+//
+// hide Intel PT (processor trace): clear CPUID.7.0:EBX[25], answer leaf
+// 0x14 with the cached invalid-leaf response, and #GP on RTIT MSRs
+// (0x560-0x58F) - consistent with a CPU that has no PT
+//
+#define STEALTH_HIDE_INTEL_PT               1
+
+//
+// mask LBR/BTF bits in IA32_DEBUGCTL (read and write) so last-branch
+// tracing cannot observe VM-exit transitions
+//
+#define STEALTH_MASK_LBR_BTF                1
 
 //
 // use cached bare-metal CPUID for invalid/hypervisor leaves
