@@ -105,6 +105,18 @@ Output: `build\bin\Release\Ophion.sys` (test-signed).
 
 ***
 
+## Requirements & Limitations
+
+- **Intel CPU only.** The driver checks the CPUID vendor string and refuses to load on AMD (VMX is Intel-only; SVM is not supported).
+- **VMX enabled in firmware**: CPUID.1:ECX[5] set and `IA32_FEATURE_CONTROL` locked with VMX-outside-SMX enabled, otherwise load fails.
+- **Nested virtualization**: if Windows runs under another hypervisor (Hyper-V, VMware, VirtualBox, ...), that hypervisor must expose nested VMX.
+- **Test signing** must be on: `bcdedit /set testsigning on`.
+- **HVCI / Memory Integrity (core isolation) must be off**, and `bcdedit /set hypervisorlaunchtype off`, otherwise Code Integrity blocks the driver.
+- **No CPU hotplug**: logical processors added after the driver loads are not virtualized.
+- **Partial launch failure rolls back automatically**: if any core fails to enter VMX, all launched cores are brought back with VMXOFF before the load fails.
+
+***
+
 ## Loading
 
 ```bash
