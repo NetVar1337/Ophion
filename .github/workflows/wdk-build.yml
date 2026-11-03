@@ -1,0 +1,65 @@
+# WDK build CI for Ophion (skeleton)
+#
+# GitHub-hosted runners do NOT include the Windows WDK, so this workflow
+# targets a SELF-HOSTED Windows x64 runner with:
+#   - Windows Server 2022 / Windows 11 x64
+#   - Visual Studio 2022 (Build Tools or Enterprise), "Desktop development
+#     with C++" workload
+#   - WDK 10.0.26100.0 (must match WindowsTargetPlatformVersion in
+#     Ophion.vcxproj)
+#
+# Register the runner with the labels used in `runs-on` below, e.g.:
+#   self-hosted, windows, wdk
+# (Settings -> Actions -> Runners -> New self-hosted runner)
+#
+# Runtime driver tests (sc create/start, memory scans, timing checks) need a
+# test VM with test signing enabled - they cannot run in CI and stay manual.
+
+name: WDK Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wdk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Ophion.sys (Release|x64)
+    runs-on: [self-hosted, windows, wdk]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # Release|x64 builds the shipping driver. To also CI the Debug
+      # config (DBG=1, HV_LOG active), turn `config` into a matrix:
+      #   strategy:
+      #     matrix:
+      #       config: [Release, Debug]
+      - name: Build driver
+        run: msbuild Ophion.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal
+
+      - name: Upload driver artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ophion.sys
+          path: build/bin/Release/Ophion.sys
+          retention-days: 14
+
+      # Follow-ups once the runner exists:
+      # - Debug|x64 build as a second matrix entry
+      # - PREfast /analyze output is already emitted into the build log
+      #   (RunCodeAnalysis is enabled in the Release config)
+      # - a smoke job on a test VM: sc create/start/stop + IOCTL_HV_STATUS
