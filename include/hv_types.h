@@ -172,7 +172,16 @@ typedef struct _VIRTUAL_MACHINE_STATE {
 #define VMCALL_VMXOFF           0x00000002
 
 // per-cpu NMI pending flag for host IDT NMI handler
+// (real .data symbol - AsmHostIdt.asm references it via EXTERN)
 extern volatile LONG g_host_nmi_pending[MAX_PROCESSORS];
+
+//
+// per-core "virtualized" flags. real .data symbol on purpose: the launch
+// check in vmx_init and the terminate DPC run in VMX non-root, where the
+// g_vcpu array is hidden by the EPT decoy - reading launched from there
+// would return decoy zeros. plain flags in .data stay guest-readable.
+//
+extern volatile LONG g_core_launched[MAX_PROCESSORS];
 
 typedef struct _HOST_IDT_STATE {
     DECLSPEC_ALIGN(16) IDT_GATE_DESCRIPTOR_64 idt[IDT_NUM_ENTRIES];
@@ -185,4 +194,3 @@ extern EPT_STATE *             g_ept;
 extern UINT32                  g_cpu_count;
 extern UINT64                  g_system_cr3;
 extern UINT64 *                g_msr_bitmap_invalid;
-extern HOST_IDT_STATE          g_host_idt;

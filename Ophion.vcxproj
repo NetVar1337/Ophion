@@ -117,6 +117,7 @@
     <ClCompile Include="src\hostcr3.c" />
     <ClCompile Include="src\hostidt.c" />
     <ClCompile Include="src\hostgdt.c" />
+    <ClCompile Include="src\dkom.c" />
   </ItemGroup>
   <!-- Assembly Files (MASM x64) -->
   <ItemGroup>
@@ -135,6 +136,7 @@
     <ClInclude Include="include\hv_types.h" />
     <ClInclude Include="include\asm_prototypes.h" />
     <ClInclude Include="include\stealth.h" />
+    <ClInclude Include="include\dkom.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

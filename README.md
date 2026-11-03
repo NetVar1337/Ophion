@@ -146,6 +146,10 @@ Defined in `include/stealth.h`:
 | `STEALTH_HIDE_INTEL_PT` | 1 | Hide Intel PT: clear CPUID.7.0:EBX[25], hide leaf 0x14, #GP on RTIT MSRs (0x560-0x58F) |
 | `STEALTH_MASK_LBR_BTF` | 1 | Mask LBR/BTF in IA32_DEBUGCTL so branch tracing can't see VM-exits |
 | `STEALTH_HIDE_VMM_PAGES` | 1 | Repoint VMM physical pages (VMCS/VMXON/stacks/EPT/host PTs) at a decoy zero page in the guest EPT, hiding them from memory scans |
+| `STEALTH_HIDE_DEVICE` | 1 | PG-safe DKOM: unlink the device object from the driver chain and remove the `\DosDevices\Ophion` symlink (restored on unload) |
+| `STEALTH_WIPE_IMAGE_FILE` | 1 | Zero the on-disk `Ophion.sys` after load so file scans find nothing |
+| `STEALTH_RELOC_GLOBALS` | 1 | Move `.data` globals (host IDT, stealth CPUID cache) into pool memory hidden by the EPT decoy |
+| `STEALTH_DKOM_MODULE` | 0 | Also unlink `PsLoadedModuleList` - PatchGuard-protected (0x109 on modern Windows), default off |
 | `USE_PRIVATE_HOST_CR3` | 1 | Isolated host page tables (deep-copied kernel PTs) |
 | `USE_PRIVATE_HOST_IDT` | 1 | Isolated host IDT (prevents NMI hijacking in VMX-root) |
 | `USE_PRIVATE_HOST_GDT` | 1 | Per-core isolated host GDT |

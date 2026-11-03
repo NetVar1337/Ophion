@@ -490,6 +490,17 @@ ept_hide_vmm_structures(PVMM_EPT_PAGE_TABLE page_table, UINT64 decoy_pa)
     if (!ept_hide_range(page_table, va_to_pa(g_ept), sizeof(EPT_STATE), decoy_pa))
         return FALSE;
 
+#if STEALTH_RELOC_GLOBALS
+    //
+    // relocated .data globals (host IDT, stealth CPUID cache) - allocated
+    // before vmx_init, so they are mapped in the private host PTs and safe
+    // to hide from the guest
+    //
+    if (g_dkom_globals &&
+        !ept_hide_range(page_table, va_to_pa(g_dkom_globals), sizeof(DKOM_GLOBALS), decoy_pa))
+        return FALSE;
+#endif
+
     for (UINT32 j = 0; j < g_cpu_count; j++)
     {
         VIRTUAL_MACHINE_STATE * v = &g_vcpu[j];

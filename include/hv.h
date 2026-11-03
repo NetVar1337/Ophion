@@ -13,6 +13,15 @@
 #include "hv_types.h"
 #include "asm_prototypes.h"
 #include "stealth.h"
+#include "dkom.h"
+
+//
+// relocated .data globals (see dkom.c) - the names stay usable everywhere,
+// they now resolve into the allocated DKOM_GLOBALS struct
+//
+#define g_stealth_enabled     (g_dkom_globals->stealth_enabled)
+#define g_stealth_cpuid_cache (g_dkom_globals->cpuid_cache)
+#define g_host_idt            (g_dkom_globals->host_idt)
 
 //
 // debug logging - compiled out unless DBG is defined (Debug config only).

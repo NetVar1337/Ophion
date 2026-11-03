@@ -504,7 +504,8 @@ vmx_virtualize_cpu(PVOID guest_stack)
 
     vmx_setup_vmcs(vcpu, guest_stack);
 
-    vcpu->launched = TRUE;
+    vcpu->launched          = TRUE;
+    g_core_launched[core]   = 1;
 
     __vmx_vmlaunch();
 
@@ -522,6 +523,7 @@ fail:
     // leave the core as we found it: clear CR4.VMXE so a failed core is
     // not left with VMX enabled and no valid VMCS
     //
+    g_core_launched[core] = 0;
     __writecr4(__readcr4() & ~CR4_VMX_ENABLE_FLAG);
     return FALSE;
 }
@@ -718,10 +720,15 @@ vmx_init(VOID)
     // otherwise the caller's vmx_terminate() would free VMCS regions and
     // VMM stacks still in use by cores running in VMX root mode.
     //
+    //
+    // note: read g_core_launched, not g_vcpu[i].launched - at this point the
+    // current core is already in VMX non-root, so the EPT decoy hides the
+    // g_vcpu pages from us; the flags live in guest-visible .data
+    //
     BOOLEAN all_launched = TRUE;
     for (UINT32 i = 0; i < g_cpu_count; i++)
     {
-        if (!g_vcpu[i].launched)
+        if (!g_core_launched[i])
         {
             HV_LOG("[hv] Core %u failed to launch!\n", i);
             all_launched = FALSE;

@@ -759,8 +759,9 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         __vmx_vmread(VMCS_GUEST_CR3, &guest_cr3);
         vcpu->vmxoff.guest_cr3 = guest_cr3;
 
-        vcpu->vmxoff.executed = TRUE;
-        vcpu->launched      = FALSE;
+        vcpu->vmxoff.executed       = TRUE;
+        vcpu->launched              = FALSE;
+        g_core_launched[vcpu->core_id] = 0;
 
         __vmx_off();
 

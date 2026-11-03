@@ -131,8 +131,20 @@ typedef struct _STEALTH_CPUID_CACHE {
 
 } STEALTH_CPUID_CACHE;
 
-extern BOOLEAN              g_stealth_enabled;
-extern STEALTH_CPUID_CACHE  g_stealth_cpuid_cache;
+//
+// PG-safe driver hiding (dkom.c) - unlinks the device object, removes the
+// \DosDevices symlink, wipes the on-disk image, and relocates .data
+// globals into EPT-hidden pool memory. does NOT touch PsLoadedModuleList.
+//
+#define STEALTH_HIDE_DEVICE                 1
+#define STEALTH_WIPE_IMAGE_FILE             1
+#define STEALTH_RELOC_GLOBALS               1
+
+//
+// full DKOM incl. PsLoadedModuleList unlink - PatchGuard-protected, bugchecks
+// 0x109 on modern Windows unless PG is disabled/bypassed. default off.
+//
+#define STEALTH_DKOM_MODULE                 0
 
 VOID stealth_init_cpuid_cache(VOID);
 
