@@ -9,7 +9,10 @@
 #define SYMLINK_NAME    L"\\DosDevices\\Ophion"
 
 #define IOCTL_BASE      0x800
-#define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+//
+// status query only reads from the device, so require read access
+//
+#define IOCTL_HV_STATUS CTL_CODE(FILE_DEVICE_UNKNOWN, IOCTL_BASE + 0, METHOD_BUFFERED, FILE_READ_ACCESS)
 
 static NTSTATUS DriverCreateClose(PDEVICE_OBJECT device_obj, PIRP irp);
 static NTSTATUS DriverIoControl(PDEVICE_OBJECT device_obj, PIRP irp);
@@ -44,19 +47,27 @@ DriverEntry(
     PDEVICE_OBJECT device_obj = NULL;
     UNICODE_STRING device_name;
     UNICODE_STRING symlink;
+    UNICODE_STRING sddl;
 
     UNREFERENCED_PARAMETER(registry_path);
 
     DbgPrintEx(0, 0, "[hv] Ophion initializing...\n");
 
+    //
+    // restrict the device to SYSTEM and Administrators - the ioctl
+    // interface is for the loader service only, not arbitrary processes
+    //
     RtlInitUnicodeString(&device_name, DEVICE_NAME);
-    status = IoCreateDevice(
+    RtlInitUnicodeString(&sddl, SDDL_DEVOBJ_SYS_ALL_ADM_ALL);
+    status = IoCreateDeviceSecure(
         driver_obj,
         0,
         &device_name,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
         FALSE,
+        &sddl,
+        NULL,
         &device_obj);
 
     if (!NT_SUCCESS(status))
@@ -127,7 +138,8 @@ DriverIoControl(
         //
         // return basic status: number of virtualized cores
         //
-        if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(UINT32))
+        if (io_stack->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(UINT32) &&
+            irp->AssociatedIrp.SystemBuffer != NULL)
         {
             *(UINT32 *)irp->AssociatedIrp.SystemBuffer = g_cpu_count;
             irp->IoStatus.Information = sizeof(UINT32);
@@ -141,7 +153,7 @@ DriverIoControl(
 
     default:
         //
-        // add more shi here later
+        // unknown ioctl
         //
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
