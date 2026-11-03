@@ -634,6 +634,19 @@ vmx_init(VOID)
         ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + IA32_DEBUGCTL / 8] |= (UCHAR)(1 << (IA32_DEBUGCTL % 8));
 #endif
 
+#if STEALTH_COMPENSATE_TIMING
+        //
+        // IA32_MPERF (0xE7) / IA32_APERF (0xE8) read+write.
+        // reads participate in the post-CPUID timing compensation path;
+        // writes #GP in the handler (read-only MSRs on bare metal)
+        //
+        for (UINT32 msr_idx = IA32_MPERF; msr_idx <= IA32_APERF; msr_idx++)
+        {
+            ((PUCHAR)vcpu->msr_bitmap_va)[msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+            ((PUCHAR)vcpu->msr_bitmap_va)[0x800 + msr_idx / 8] |= (UCHAR)(1 << (msr_idx % 8));
+        }
+#endif
+
         vcpu->msr_bitmap_pa = va_to_pa(
             (PVOID)vcpu->msr_bitmap_va);
 

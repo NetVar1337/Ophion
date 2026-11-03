@@ -303,10 +303,34 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
         //
         case 0x10:
         {
+            size_t tsc_offset_raw = 0;
+            __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &tsc_offset_raw);
+
+#if STEALTH_COMPENSATE_TIMING
+            //
+            // RDMSR(0x10) right after a CPUID exit is the MSR-based variant of
+            // the RDTSC timing attack - compensate it the same way
+            //
+            if (g_stealth_enabled && vcpu->tsc_rdtsc_armed)
+            {
+                msr.Flags = vcpu->tsc_cpuid_entry
+                          + g_stealth_cpuid_cache.bare_metal_cpuid_cost
+                          + (UINT64)(INT64)tsc_offset_raw;
+
+                vcpu->tsc_rdtsc_armed = FALSE;
+
+                if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
+                {
+                    size_t proc_ctrl = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
+                    proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+                }
+            }
+            else
+#endif
             if (g_stealth_enabled)
             {
-                size_t tsc_offset_raw = 0;
-                __vmx_vmread(VMCS_CTRL_TSC_OFFSET, &tsc_offset_raw);
                 msr.Flags = (UINT64)((INT64)__rdtsc() + (INT64)tsc_offset_raw);
             }
             else
@@ -316,14 +340,65 @@ vmexit_handle_msr_read(VIRTUAL_MACHINE_STATE * vcpu)
             break;
         }
 
+#if STEALTH_COMPENSATE_TIMING
+        case IA32_MPERF:
+        case IA32_APERF:
+        {
+            //
+            // MPERF/APERF increment at a fixed reference rate, so a
+            // RDMSR(0xE7/0xE8) -> CPUID -> RDMSR(0xE7/0xE8) loop measures
+            // VM-exit overhead just like RDTSC. compensate the armed read by
+            // adding the calibrated bare-metal CPUID cost to the value captured
+            // at CPUID exit; unarmed reads pass through at hardware speed.
+            //
+            UINT64 val = __readmsr(target_msr);
+
+            if (g_stealth_enabled && vcpu->tsc_rdtsc_armed)
+            {
+                val = (target_msr == IA32_MPERF ? vcpu->mperf_cpuid_entry
+                                                : vcpu->aperf_cpuid_entry)
+                    + g_stealth_cpuid_cache.bare_metal_cpuid_cost;
+
+                vcpu->tsc_rdtsc_armed = FALSE;
+
+                if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
+                {
+                    size_t proc_ctrl = 0;
+                    __vmx_vmread(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, &proc_ctrl);
+                    proc_ctrl &= ~(size_t)CPU_BASED_VM_EXEC_CTRL_RDTSC_EXITING;
+                    __vmx_vmwrite(VMCS_CTRL_PROCESSOR_BASED_VM_EXECUTION_CONTROLS, proc_ctrl);
+                }
+            }
+
+            msr.Flags = val;
+            break;
+        }
+#endif
+
         case IA32_FEATURE_CONTROL:
         {
             //
-            // return the real hardware value: the hypervisor itself requires
-            // VMX outside SMX enabled, so bare metal has Lock=1 and
-            // EnableVmxOutsideSmx=1 - masking them would be detectable
+            // stealth model: "CPU supports VMX but firmware locked it off".
+            // Lock=1 with all enable bits clear is consistent with
+            // CPUID.1:ECX[6] (SMX) being cleared and with the VMX capability
+            // MSRs staying readable (they exist whenever ECX[5]=1).
+            // writes #GP in the write handler (MSR is locked).
             //
-            msr.Flags = __readmsr(IA32_FEATURE_CONTROL);
+            IA32_FEATURE_CONTROL_REGISTER feat = {0};
+            feat.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
+
+            if (g_stealth_enabled)
+            {
+                feat.Lock                      = 1;
+                feat.EnableVmxInsideSmx        = 0;
+                feat.EnableVmxOutsideSmx       = 0;
+                feat.SenterLocalFunctionEnables = 0;
+                feat.SenterGlobalEnable        = 0;
+                feat.SgxLaunchControlEnable    = 0;
+                feat.SgxGlobalEnable           = 0;
+            }
+
+            msr.Flags = feat.AsUInt;
             break;
         }
 
@@ -931,9 +1006,20 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
     // RDTSC exiting to avoid trapping unrelated RDTSCs.
     //
 #if STEALTH_COMPENSATE_TIMING
+    //
+    // RDMSR(0x10)/RDMSR(MPERF)/RDMSR(APERF) also consume the armed flag -
+    // they are alternative timing reads for the RDTSC -> CPUID -> RDTSC pattern
+    //
+    BOOLEAN timing_read =
+        (exit_reason == VMX_EXIT_REASON_EXECUTE_RDMSR &&
+         ((UINT32)regs->rcx == 0x10 ||
+          (UINT32)regs->rcx == IA32_MPERF ||
+          (UINT32)regs->rcx == IA32_APERF));
+
     if (vcpu->tsc_rdtsc_armed &&
         exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSC &&
-        exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSCP)
+        exit_reason != VMX_EXIT_REASON_EXECUTE_RDTSCP &&
+        !timing_read)
     {
         vcpu->tsc_rdtsc_armed = FALSE;
 
@@ -1074,8 +1160,10 @@ vmexit_handler(_Inout_ PGUEST_REGS regs, _In_ VIRTUAL_MACHINE_STATE * vcpu)
         //
         if (g_stealth_enabled)
         {
-            vcpu->tsc_cpuid_entry = exit_tsc_start;
-            vcpu->tsc_rdtsc_armed = TRUE;
+            vcpu->tsc_cpuid_entry   = exit_tsc_start;
+            vcpu->mperf_cpuid_entry = __readmsr(IA32_MPERF);
+            vcpu->aperf_cpuid_entry = __readmsr(IA32_APERF);
+            vcpu->tsc_rdtsc_armed   = TRUE;
 
             if (!g_stealth_cpuid_cache.rdtsc_exiting_forced)
             {

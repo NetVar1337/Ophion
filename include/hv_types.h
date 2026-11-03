@@ -133,7 +133,9 @@ typedef struct _VIRTUAL_MACHINE_STATE {
     // TSC_OFFSET is never modified — zero drift, zero monotonicity issues.
     //
     UINT64  tsc_cpuid_entry;        // TSC recorded at start of CPUID VM-exit handler
-    BOOLEAN tsc_rdtsc_armed;        // TRUE = next RDTSC/RDTSCP should be compensated
+    UINT64  mperf_cpuid_entry;      // IA32_MPERF recorded at start of CPUID VM-exit
+    UINT64  aperf_cpuid_entry;      // IA32_APERF recorded at start of CPUID VM-exit
+    BOOLEAN tsc_rdtsc_armed;        // TRUE = next RDTSC/RDTSCP/RDMSR(0x10|MPERF|APERF) is compensated
 
     //
     // pending external interrupt for deferred re-injection
