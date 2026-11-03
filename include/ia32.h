@@ -31,6 +31,8 @@
 
 #define IA32_FEATURE_CONTROL           0x0000003A
 #define IA32_DEBUGCTL                  0x000001D9
+#define IA32_MPERF                     0x000000E7
+#define IA32_APERF                     0x000000E8
 
 //
 // Intel PT (RTIT) MSRs, hidden under STEALTH_HIDE_INTEL_PT.

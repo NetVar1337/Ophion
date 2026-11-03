@@ -24,7 +24,7 @@ Intel VT-x Type-2 hypervisor that virtualizes an already running Windows system.
 - **Private host GDT** — Per-core isolated GDT for VMX-root mode. Each core has its own TSS, so the private GDT is per-VCPU. On VMXOFF, clears TSS busy bit and reloads original GDTR/TR.
 - **CPUID caching** — Caches bare-metal CPUID at init. Invalid/hypervisor-range leaves return cached native values. Clears ECX[31] on leaf 1.
 - **CR4.VMXE hiding** — Guest CR4 reads/writes go through shadow with VMXE stripped. CR0/CR4 writes enforce VMX fixed bits in actual VMCS.
-- **TSC compensation** — "Trap next RDTSC" after CPUID VM-exit. Returns `cpuid_entry_tsc + bare_metal_cost + offset`. TSC_OFFSET never modified — zero drift.
+- **TSC compensation** — "Trap next RDTSC" after CPUID VM-exit. Returns `cpuid_entry_tsc + bare_metal_cost + offset`. TSC_OFFSET never modified — zero drift. The same post-CPUID compensation covers RDTSCP, `RDMSR(0x10)`, and `RDMSR(IA32_MPERF/APERF)` (0xE7/0xE8), closing the MSR-based variants of the timing attack.
 - **MSR emulation** — Intercepts RDMSR(0x10) to apply TSC offset. Synthetic MSR range (0x40000000+) injects #GP.
 - **External interrupt re-injection** — ACK-on-exit with deferred delivery via interrupt-window exiting when guest is not interruptible. TPR priority masking via shadowed CR8.
 - **IDT vectoring** — Re-injects interrupted IDT events with priority. NMI deferral via NMI-window exiting on collision. Exception combining per SDM Table 6-5 (#DF generation, triple fault on #DF+exception).
@@ -171,7 +171,7 @@ Defined in `include/stealth.h`:
 |--------|---------|-------------|
 | `STEALTH_ENABLED` | 1 | Master stealth switch |
 | `STEALTH_HIDE_CR4_VMXE` | 1 | Hide CR4.VMXE from guest via CR4 shadow |
-| `STEALTH_COMPENSATE_TIMING` | 1 | TSC compensation for RDTSC+CPUID+RDTSC timing attacks |
+| `STEALTH_COMPENSATE_TIMING` | 1 | Timing compensation after CPUID VM-exit for RDTSC / RDTSCP / RDMSR(0x10) / RDMSR(MPERF/APERF) |
 | `STEALTH_CPUID_CACHING` | 1 | Cache native CPUID responses for invalid/hypervisor leaves |
 | `STEALTH_HIDE_INTEL_PT` | 1 | Hide Intel PT: clear CPUID.7.0:EBX[25], hide leaf 0x14, #GP on RTIT MSRs (0x560-0x58F) |
 | `STEALTH_MASK_LBR_BTF` | 1 | Mask LBR/BTF in IA32_DEBUGCTL so branch tracing can't see VM-exits |
@@ -201,6 +201,15 @@ Passes with all stealth toggles enabled:
 - [checkhv_um](https://github.com/zer0condition/checkhv_um) — RDTSC+CPUID+RDTSC timing, CPUID leaf enumeration, brand string
 
 ![VMAware](vmaware.png)
+
+### Known detection limits (not fixable in software alone)
+
+- **PMC-based counting** (`RDPMC` passes architectural counters through; VM-exit overhead appears in guest cycle counts)
+- **Wall-clock MMIO timing** — HPET / LAPIC timer current-count registers are not EPT-intercepted
+- **EPT memory-access timing** and **cache/BTB pollution** from VM-exit/entry — inherent to any EPT hypervisor
+- **SMM-level observation** — SMM runs outside hypervisor visibility
+- **`CR4.VMXE` write-then-read** — writing VMXE=1 reads back 0 under the shadow (intentional cost of VMXE hiding)
+
 ***
 
 ## Disclaimer
