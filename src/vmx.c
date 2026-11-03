@@ -33,7 +33,7 @@ vmx_check_support(VOID)
         (UINT32)data.edx != CPUID_VENDOR_INTEL_EDX ||
         (UINT32)data.ecx != CPUID_VENDOR_INTEL_ECX)
     {
-        DbgPrintEx(0, 0, "[hv] CPU vendor is not GenuineIntel - VMX not supported\n");
+        HV_LOG("[hv] CPU vendor is not GenuineIntel - VMX not supported\n");
         return FALSE;
     }
 
@@ -43,7 +43,7 @@ vmx_check_support(VOID)
     __cpuid((int *)&data, CPUID_PROCESSOR_FEATURES);
     if (!_bittest((const LONG *)&data.ecx, CPUID_VMX_BIT))
     {
-        DbgPrintEx(0, 0, "[hv] CPUID.1:ECX[5] clear - VMX not supported by this CPU\n");
+        HV_LOG("[hv] CPUID.1:ECX[5] clear - VMX not supported by this CPU\n");
         return FALSE;
     }
 
@@ -54,20 +54,20 @@ vmx_check_support(VOID)
     //
     if (_bittest((const LONG *)&data.ecx, 31))
     {
-        DbgPrintEx(0, 0, "[hv] Running under another hypervisor - nested VMX required\n");
+        HV_LOG("[hv] Running under another hypervisor - nested VMX required\n");
     }
 
     feat_ctrl.AsUInt = __readmsr(IA32_FEATURE_CONTROL);
 
     if (!feat_ctrl.Lock)
     {
-        DbgPrintEx(0, 0, "[hv] IA32_FEATURE_CONTROL not locked - VMXON would fail\n");
+        HV_LOG("[hv] IA32_FEATURE_CONTROL not locked - VMXON would fail\n");
         return FALSE;
     }
 
     if (!feat_ctrl.EnableVmxOutsideSmx)
     {
-        DbgPrintEx(0, 0, "[hv] IA32_FEATURE_CONTROL: VMX outside SMX disabled by BIOS\n");
+        HV_LOG("[hv] IA32_FEATURE_CONTROL: VMX outside SMX disabled by BIOS\n");
         return FALSE;
     }
 
@@ -262,7 +262,7 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
     vcpu->mov_dr_exiting = !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_MOV_DR_EXITING);
     vcpu->guest_cr8 = (UINT8)__readcr8();
 
-    DbgPrintEx(0, 0, "[hv] Primary proc controls: 0x%08X (CR3load=%d CR3store=%d INVLPG=%d HLT=%d RDTSC=%d MOVDR=%d TSCoff=%d)\n",
+    HV_LOG("[hv] Primary proc controls: 0x%08X (CR3load=%d CR3store=%d INVLPG=%d HLT=%d RDTSC=%d MOVDR=%d TSCoff=%d)\n",
              pri_proc,
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_LOAD_EXITING),
              !!(pri_proc & CPU_BASED_VM_EXEC_CTRL_CR3_STORE_EXITING),
@@ -300,7 +300,7 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     __vmx_vmwrite(VMCS_CTRL_PIN_BASED_VM_EXECUTION_CONTROLS, pin_ctrl);
 
-    DbgPrintEx(0, 0, "[hv] Pin controls: 0x%08X (ExtInt=%d NMI=%d VirtNMI=%d Preempt=%d)\n",
+    HV_LOG("[hv] Pin controls: 0x%08X (ExtInt=%d NMI=%d VirtNMI=%d Preempt=%d)\n",
              pin_ctrl,
              !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_EXTERNAL_INTERRUPT_EXITING),
              !!(pin_ctrl & PIN_BASED_VM_EXEC_CTRL_NMI_EXITING),
@@ -326,7 +326,7 @@ vmx_setup_vmcs(VIRTUAL_MACHINE_STATE * vcpu, PVOID guest_stack)
 
     __vmx_vmwrite(VMCS_CTRL_PRIMARY_VMEXIT_CONTROLS, exit_ctrl);
 
-    DbgPrintEx(0, 0, "[hv] Exit controls: 0x%08X (AckInt=%d)\n",
+    HV_LOG("[hv] Exit controls: 0x%08X (AckInt=%d)\n",
              exit_ctrl, !!(exit_ctrl & VM_EXIT_CTRL_ACK_INTERRUPT_ON_EXIT));
 
     //
@@ -486,7 +486,7 @@ vmx_virtualize_cpu(PVOID guest_stack)
 
     if (__vmx_on(&vcpu->vmxon_pa))
     {
-        DbgPrintEx(0, 0, "[hv] VMXON failed on core %u\n", core);
+        HV_LOG("[hv] VMXON failed on core %u\n", core);
         goto fail;
     }
 
@@ -515,7 +515,7 @@ vmx_virtualize_cpu(PVOID guest_stack)
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
 
-    DbgPrintEx(0, 0, "[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
+    HV_LOG("[hv] VMLAUNCH failed on core %u, error: 0x%llx\n", core, error_code);
 
 fail:
     //
@@ -538,7 +538,7 @@ vmx_vmresume(VOID)
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &error_code);
     __vmx_off();
 
-    DbgPrintEx(0, 0, "[hv] VMRESUME failed! Error: 0x%llx\n", error_code);
+    HV_LOG("[hv] VMRESUME failed! Error: 0x%llx\n", error_code);
 }
 
 BOOLEAN
@@ -571,7 +571,7 @@ vmx_init(VOID)
 
     if (!ept_init())
     {
-        DbgPrintEx(0, 0, "[hv] EPT initialization failed!\n");
+        HV_LOG("[hv] EPT initialization failed!\n");
         return FALSE;
     }
 
@@ -660,7 +660,7 @@ vmx_init(VOID)
 #if USE_PRIVATE_HOST_CR3
     if (!hostcr3_build())
     {
-        DbgPrintEx(0, 0, "[hv] Host CR3 build failed!\n");
+        HV_LOG("[hv] Host CR3 build failed!\n");
         return FALSE;
     }
 #endif
@@ -672,7 +672,7 @@ vmx_init(VOID)
 #if USE_PRIVATE_HOST_IDT
     if (!hostidt_build())
     {
-        DbgPrintEx(0, 0, "[hv] Host IDT build failed!\n");
+        HV_LOG("[hv] Host IDT build failed!\n");
         return FALSE;
     }
 #endif
@@ -690,19 +690,19 @@ vmx_init(VOID)
     {
         if (!g_vcpu[i].launched)
         {
-            DbgPrintEx(0, 0, "[hv] Core %u failed to launch!\n", i);
+            HV_LOG("[hv] Core %u failed to launch!\n", i);
             all_launched = FALSE;
         }
     }
 
     if (!all_launched)
     {
-        DbgPrintEx(0, 0, "[hv] Partial launch failure - VMXOFF on all launched cores\n");
+        HV_LOG("[hv] Partial launch failure - VMXOFF on all launched cores\n");
         broadcast_terminate_all();
         return FALSE;
     }
 
-    DbgPrintEx(0, 0, "[hv] All %u cores virtualized successfully!\n", g_cpu_count);
+    HV_LOG("[hv] All %u cores virtualized successfully!\n", g_cpu_count);
     return TRUE;
 }
 
@@ -765,5 +765,5 @@ vmx_terminate(VOID)
     ExFreePoolWithTag(g_vcpu, HV_POOL_TAG);
     g_vcpu = NULL;
 
-    DbgPrintEx(0, 0, "[hv] VMX terminated on all cores.\n");
+    HV_LOG("[hv] VMX terminated on all cores.\n");
 }

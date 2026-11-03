@@ -22,7 +22,7 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
 {
     UNICODE_STRING symlink;
 
-    DbgPrintEx(0, 0, "[hv] Unloading hypervisor driver...\n");
+    HV_LOG("[hv] Unloading hypervisor driver...\n");
 
     broadcast_terminate_all();
     vmx_terminate();
@@ -35,7 +35,7 @@ DriverUnload(_In_ PDRIVER_OBJECT driver_obj)
         IoDeleteDevice(driver_obj->DeviceObject);
     }
 
-    DbgPrintEx(0, 0, "[hv] Driver unloaded.\n");
+    HV_LOG("[hv] Driver unloaded.\n");
 }
 
 NTSTATUS
@@ -51,7 +51,7 @@ DriverEntry(
 
     UNREFERENCED_PARAMETER(registry_path);
 
-    DbgPrintEx(0, 0, "[hv] Ophion initializing...\n");
+    HV_LOG("[hv] Ophion initializing...\n");
 
     //
     // restrict the device to SYSTEM and Administrators - the ioctl
@@ -72,7 +72,7 @@ DriverEntry(
 
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(0, 0, "[hv] IoCreateDevice failed: 0x%X\n", status);
+        HV_LOG("[hv] IoCreateDevice failed: 0x%X\n", status);
         return status;
     }
 
@@ -81,7 +81,7 @@ DriverEntry(
 
     if (!NT_SUCCESS(status))
     {
-        DbgPrintEx(0, 0, "[hv] IoCreateSymbolicLink failed: 0x%X\n", status);
+        HV_LOG("[hv] IoCreateSymbolicLink failed: 0x%X\n", status);
         IoDeleteDevice(device_obj);
         return status;
     }
@@ -93,14 +93,14 @@ DriverEntry(
 
     if (!vmx_init())
     {
-        DbgPrintEx(0, 0, "[hv] VMX initialization FAILED!\n");
+        HV_LOG("[hv] VMX initialization FAILED!\n");
         vmx_terminate();  // clean up any partially-allocated resources
         IoDeleteSymbolicLink(&symlink);
         IoDeleteDevice(device_obj);
         return STATUS_HV_OPERATION_FAILED;
     }
 
-    DbgPrintEx(0, 0, "[hv] Hypervisor loaded and active on all cores!\n");
+    HV_LOG("[hv] Hypervisor loaded and active on all cores!\n");
     return STATUS_SUCCESS;
 }
 

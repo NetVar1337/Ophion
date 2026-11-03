@@ -14,6 +14,17 @@
 #include "asm_prototypes.h"
 #include "stealth.h"
 
+//
+// debug logging - compiled out unless DBG is defined (Debug config only).
+// release builds must not log from the vm-exit path: it leaks timing
+// and reveals hypervisor presence to debug-output based detection.
+//
+#ifdef DBG
+#define HV_LOG(...) DbgPrintEx(0, 0, __VA_ARGS__)
+#else
+#define HV_LOG(...) ((void)0)
+#endif
+
 UINT64 va_to_pa(PVOID va);
 PVOID  pa_to_va(UINT64 pa);
 UINT64 get_system_cr3(VOID);

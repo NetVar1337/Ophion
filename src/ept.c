@@ -16,7 +16,7 @@ ept_check_features(VOID)
 
     if (!vpid_reg.PageWalkLength4 || !vpid_reg.MemoryTypeWriteBack || !vpid_reg.Pde2MbPages)
     {
-        DbgPrintEx(0, 0, "[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
+        HV_LOG("[hv] EPT: Missing required features (PW4=%d WB=%d 2MB=%d)\n",
                  vpid_reg.PageWalkLength4, vpid_reg.MemoryTypeWriteBack, vpid_reg.Pde2MbPages);
         return FALSE;
     }
@@ -29,7 +29,7 @@ ept_check_features(VOID)
     g_ept->invvpid_all_contexts           = vpid_reg.InvvpidAllContexts ? TRUE : FALSE;
     g_ept->invvpid_single_retaining_globals = vpid_reg.InvvpidSingleContextRetainingGlobals ? TRUE : FALSE;
 
-    DbgPrintEx(0, 0, "[hv] INVVPID caps: supported=%d individual=%d single=%d all=%d retaining_globals=%d\n",
+    HV_LOG("[hv] INVVPID caps: supported=%d individual=%d single=%d all=%d retaining_globals=%d\n",
              g_ept->invvpid_supported,
              g_ept->invvpid_individual_addr,
              g_ept->invvpid_single_context,
@@ -38,7 +38,7 @@ ept_check_features(VOID)
 
     if (!mtrr_def.MtrrEnable)
     {
-        DbgPrintEx(0, 0, "[hv] EPT: MTRR not enabled\n");
+        HV_LOG("[hv] EPT: MTRR not enabled\n");
         return FALSE;
     }
 
@@ -225,7 +225,7 @@ ept_setup_pml2(PVMM_EPT_PAGE_TABLE page_table, PEPT_PML2_ENTRY new_entry, SIZE_T
         // ept_split_large_page as needed for EPT hooks.
         //
         new_entry->MemoryType = ept_get_memory_type(pfn, TRUE);
-        DbgPrintEx(0, 0, "[hv] EPT: Page at PFN 0x%llx crosses MTRR boundary (split recommended)\n",
+        HV_LOG("[hv] EPT: Page at PFN 0x%llx crosses MTRR boundary (split recommended)\n",
                  pfn);
         return TRUE;
     }
@@ -312,7 +312,7 @@ ept_init(VOID)
         PVMM_EPT_PAGE_TABLE page_table = ept_alloc_identity_map();
         if (!page_table)
         {
-            DbgPrintEx(0, 0, "[hv] EPT: Failed to allocate page table for core %u\n", i);
+            HV_LOG("[hv] EPT: Failed to allocate page table for core %u\n", i);
             return FALSE;
         }
 
@@ -331,7 +331,7 @@ ept_init(VOID)
         g_vcpu[i].ept_pointer = eptp;
     }
 
-    DbgPrintEx(0, 0, "[hv] EPT initialized for %u processors\n", g_cpu_count);
+    HV_LOG("[hv] EPT initialized for %u processors\n", g_cpu_count);
     return TRUE;
 }
 
