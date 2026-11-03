@@ -105,6 +105,36 @@ Output: `build\bin\Release\Ophion.sys` (test-signed).
 
 ***
 
+## CI (self-hosted WDK runner)
+
+`.github/workflows/wdk-build.yml` builds `Ophion.sys` (Release|x64) on every push/PR to `master` and uploads the `.sys` as a build artifact. GitHub-hosted runners don't include the Windows WDK, so the workflow targets a **self-hosted runner** labeled `self-hosted, windows, wdk`.
+
+### 1. Prepare a Windows x64 machine
+
+- Windows Server 2022 or Windows 11, x64
+- Visual Studio 2022 (Build Tools or Enterprise) with the **Desktop development with C++** workload
+- **WDK 10.0.26100.0** — must match `WindowsTargetPlatformVersion` in `Ophion.vcxproj`
+
+### 2. Register the runner
+
+On the repo page: **Settings → Actions → Runners → New self-hosted runner**. On the Windows machine, download and configure the runner with the labels the workflow expects:
+
+```powershell
+# in the runner directory downloaded from GitHub
+.\config.cmd --url https://github.com/NetVar1337/Ophion --token <RUNNER_TOKEN> --labels self-hosted,windows,wdk
+.\run.cmd            # or install as a service: .\svc install / .\svc start
+```
+
+The labels must include `self-hosted`, `windows`, and `wdk` to match `runs-on: [self-hosted, windows, wdk]` in the workflow.
+
+### 3. Verify
+
+Push a branch or open a PR — the **Actions** tab should show `WDK Build` running; on success, `Ophion.sys` is available under the run's **Artifacts**. Until a runner is registered, the workflow stays pending.
+
+> Runtime tests (loading the driver with `sc create/start`, memory scans, timing checks) need a test VM with test signing enabled (`bcdedit /set testsigning on`) — they are **not** part of CI and stay manual.
+
+***
+
 ## Requirements & Limitations
 
 - **Intel CPU only.** The driver checks the CPUID vendor string and refuses to load on AMD (VMX is Intel-only; SVM is not supported).
