@@ -811,6 +811,17 @@ vmexit_handle_vmcall(VIRTUAL_MACHINE_STATE * vcpu)
         return;
     }
 
+    //
+    // per-boot nonce in r13: without it, ring-0 code cannot trigger
+    // VMCALL_VMXOFF and tear down VMX on a core mid-operation
+    //
+    if (regs->r13 != g_vmxoff_nonce)
+    {
+        vmexit_inject_ud();
+        vcpu->advance_rip = FALSE;
+        return;
+    }
+
     UINT64 vmcall_num = regs->rcx;
 
     switch (vmcall_num)

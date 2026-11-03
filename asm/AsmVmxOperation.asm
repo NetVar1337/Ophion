@@ -4,6 +4,8 @@
 PUBLIC asm_enable_vmx
 PUBLIC asm_vmx_vmcall
 
+EXTERN g_vmxoff_nonce:QWORD
+
 .code _text
 
 asm_enable_vmx PROC
@@ -27,13 +29,16 @@ asm_vmx_vmcall PROC
     push    r10
     push    r11
     push    r12
+    push    r13
 
     mov     r10, 48564653h          ; 'HVFS'  — signature
     mov     r11, 564d43414c4ch      ; 'VMCALL' — signature
     mov     r12, 4e4f485950455256h  ; 'NOHYPERV' — signature
+    mov     r13, qword ptr [g_vmxoff_nonce]  ; per-boot VMXOFF nonce
 
     vmcall
 
+    pop     r13
     pop     r12
     pop     r11
     pop     r10

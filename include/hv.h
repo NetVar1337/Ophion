@@ -46,6 +46,7 @@ UINT64  hostcr3_get(VOID);
 VOID    hostcr3_destroy(VOID);
 UINT32  hostcr3_get_pt_page_count(VOID);
 UINT64  hostcr3_get_pt_page_pa(UINT32 index);
+BOOLEAN hostcr3_pf_sync(UINT64 cr2);
 
 //
 // private host IDT (hostidt.c)

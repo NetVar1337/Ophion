@@ -202,6 +202,26 @@ Passes with all stealth toggles enabled:
 
 ![VMAware](vmaware.png)
 
+### CPUID / MSR consistency audit
+
+What the guest sees vs. bare metal, with all stealth toggles enabled:
+
+| Query | Under Ophion | Bare-metal consistent because |
+|-------|--------------|-------------------------------|
+| CPUID.1:ECX[31] (hypervisor) | cleared | no hypervisor present |
+| CPUID.1:ECX[6] (SMX) | cleared | matches FEATURE_CONTROL enable bits = 0 |
+| CPUID invalid / 0x40000000+ leaves | cached bare-metal response | byte-identical to real out-of-range leaves |
+| CPUID.7.0:EBX[25] (Intel PT) | cleared | PT treated as absent |
+| CPUID leaf 0x14 | all zeros | what a PT-less CPU returns |
+| CPUID 0x15/0x16, 0x8000001E, 0xB/0x1F, 0x10A, SGX | pass-through | real CPU values |
+| RDMSR 0x3A (FEATURE_CONTROL) | Lock=1, all enable bits 0 | "firmware locked VMX off" model |
+| VMX MSRs 0x480-0x493 | real values; writes #GP | they exist whenever ECX[5]=1 |
+| Synthetic MSRs 0x40000000+ | #GP | bare metal #GPs them |
+| RDMSR 0x10 / 0xE7 / 0xE8 | pass-through + post-CPUID compensation | zero TSC drift, plausible deltas |
+| RDMSR/WRMSR 0x1D9 (DEBUGCTL) | LBR/BTF masked | LBR can never be enabled, so LBR stack MSRs stay empty - no interception needed |
+| RTIT MSRs 0x560-0x58F | #GP | PT-less CPU behavior |
+| RDPMC | pass-through (see limits below) | — |
+
 ### Known detection limits (not fixable in software alone)
 
 - **PMC-based counting** (`RDPMC` passes architectural counters through; VM-exit overhead appears in guest cycle counts)

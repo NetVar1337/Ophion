@@ -575,11 +575,11 @@ ept_hide_vmm_pages(VOID)
     }
 
     //
-    // pass 2: the 4kb splits created in pass 1 contain PML1 arrays full of
-    // the decoy PFN - a visible signature. hide those split structures too.
-    // splits created by this pass stay visible; one extra pass is enough
-    // in practice.
+    // further passes: the 4kb splits created by a pass contain PML1 arrays
+    // full of the decoy PFN - a visible signature - so hide those split
+    // structures too. repeat until a pass creates no new splits (bounded).
     //
+    for (UINT32 pass = 0; pass < 4; pass++)
     {
         UINT32 splits_before = 0;
         for (PLIST_ENTRY e = g_ept->hooked_pages.Flink; e != &g_ept->hooked_pages; e = e->Flink)
@@ -601,6 +601,16 @@ ept_hide_vmm_pages(VOID)
                     return FALSE;
             }
         }
+
+        //
+        // stable when a pass created no new splits
+        //
+        UINT32 splits_after = 0;
+        for (PLIST_ENTRY e = g_ept->hooked_pages.Flink; e != &g_ept->hooked_pages; e = e->Flink)
+            splits_after++;
+
+        if (splits_after == splits_before)
+            break;
     }
 
     HV_LOG("[hv] EPT: VMM pages hidden behind decoy PA 0x%llx\n", decoy_pa);

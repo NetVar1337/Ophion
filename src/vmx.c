@@ -552,6 +552,14 @@ vmx_init(VOID)
     if (!vmx_check_support())
         return FALSE;
 
+    //
+    // per-boot nonce gating VMCALL_VMXOFF (set here so asm_vmx_vmcall can
+    // load it into r13; unknown to any other ring-0 code)
+    //
+    g_vmxoff_nonce = __rdtsc()
+                   ^ (UINT64)(ULONG_PTR)&g_vmxoff_nonce
+                   ^ 0x9E3779B97F4A7C15ULL;
+
     g_cpu_count = KeQueryActiveProcessorCount(0);
 
     g_vcpu = (VIRTUAL_MACHINE_STATE *)ExAllocatePool2(
